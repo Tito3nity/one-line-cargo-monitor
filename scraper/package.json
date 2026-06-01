@@ -1,0 +1,16 @@
+{
+  "name": "one-line-scraper",
+  "version": "1.0.0",
+  "description": "ONE Line cargo tracking auto-scraper",
+  "main": "scraper.js",
+  "scripts": {
+    "start": "node scraper.js",
+    "test":  "node scraper.js --dry-run"
+  },
+  "dependencies": {
+    "googleapis": "^140.0.0",
+    "nodemailer":  "^6.9.14",
+    "puppeteer":   "^22.12.1"
+  },
+  "engines": { "node": ">=18" }
+}
