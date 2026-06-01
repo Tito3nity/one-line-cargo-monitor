@@ -30,7 +30,7 @@ const ONE_LINE_URL = "https://ecomm.one-line.com/one-ecom/manage-shipment/cargo-
 // Maps ONE Line event text → our status labels
 function mapStatus(eventText = "", place = "") {
   const t = (eventText + " " + place).toLowerCase();
-  if (t.includes("gate out") || t.includes("delivered"))          return "Delivered";
+  if (t.includes("gate out") || t.includes("delivered") || t.includes("returned"))          return "Delivered";
   if (t.includes("discharg") || t.includes("unload"))             return "At Port";
   if (t.includes("customs") || t.includes("clearance"))           return "Customs";
   if (t.includes("delay") || t.includes("weather"))               return "Delayed";
@@ -98,7 +98,7 @@ async function scrapeOneLine(page, searchCode) {
       () => document.querySelector("table tbody tr") ||
             document.querySelector(".no-data") ||
             document.body.innerText.includes("No Data"),
-      { timeout: 20000 }
+      { timeout: 45000 }
     );
     await new Promise(r => setTimeout(r, 1500));   // extra wait for JS render
 
