@@ -1,34 +1,34 @@
 name: ONE Line Daily Cargo Tracker
 
-  on:
+on:
   schedule:
     - cron: '0 1 * * *'
-        workflow_dispatch:
+  workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-          timeout-minutes: 30
+    timeout-minutes: 30
 
-                steps:
+    steps:
       - name: Checkout repository
-                uses: actions/checkout@v4
+        uses: actions/checkout@v4
 
-                        - name: Setup Node.js
-                                  uses: actions/setup-node@v4
-                                            with:
-                                              node-version: '20'
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
-                                          - name: Install scraper dependencies
-                                                    working-directory: ./scraper
-                                                              run: npm install
+      - name: Install scraper dependencies
+        working-directory: ./scraper
+        run: npm install
 
-                                                                      - name: Install Chromium
-                                                                                run: npx puppeteer browsers install chrome
+      - name: Install Chromium
+        run: npx puppeteer browsers install chrome
 
-                                                                                        - name: Run ONE Line cargo tracker
-                                                                                                  working-directory: ./scraper
-                                                                                                            env:
+      - name: Run ONE Line cargo tracker
+        working-directory: ./scraper
+        env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
           ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
