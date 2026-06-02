@@ -4,7 +4,7 @@ const GLOBAL_CSS = `
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Barlow+Condensed:wght@500;600;700;800;900&display=swap');
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
 body{background:#05111F;color:#C8DCF0;font-family:'IBM Plex Mono',monospace;min-height:100vh;}
-::-webkit-scrollbar{width:5px;height:5px;}::-webkit-scrollbar-track{background:#05111F;}::-webkit-scrollbar-thumb{background:#1A3554;border-radius:3px;}
+::-webkit-scrollbar{width:5px;height:5px;}::-webkit-scrolhlbar-track{background:#05111F;}::-webkit-scrollbar-thumb{background:#1A3554;border-radius:3px;}
 button{cursor:pointer;border:none;font-family:'Barlow Condensed',sans-serif;}
 input,select{font-family:'IBM Plex Mono',monospace;}
 .fade-in{animation:fadeIn .3s ease;}@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
@@ -101,7 +101,7 @@ method:"POST",
 headers:{"Content-Type":"application/json"},
 body:JSON.stringify({messages:[{role:"user",content:prompt}]}),
 });
-if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||"HTTP "+res.status);}
+if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error?.message||e.error||"HTTP "+res.status);}
 const data=await res.json();
 const text=data.content?.find(b=>b.type==="text")?.text||"";
 if(!text)throw new Error("Empty response. Check ANTHROPIC_API_KEY in Netlify env vars.");
