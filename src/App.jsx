@@ -33,7 +33,7 @@ const STATUS_CONFIG={
 "Customs":{cls:"badge-customs",icon:"🛂",color:"#F0B400",progress:82},
 "Delayed":{cls:"badge-delayed",icon:"⚠️",color:"#E05050",progress:45},
 "Arrived":{cls:"badge-arrived",icon:"✅",color:"#28C878",progress:90},
-"Delivered":{cls:"badge-arrived",icon:"✅",color:"#28C878",progress:100},
+"Delivered":{cls:"badge-arrived",icon:"✅",color:"#28C878",progress:100},"Pending Sync":{cls:"badge-default",icon:"⏳",color:"#7A9AB8",progress:0},
 "Departed":{cls:"badge-transit",icon:"🚢",color:"#5B9FFF",progress:30},
 };
 const getStatusCfg=(s)=>STATUS_CONFIG[s]||{cls:"badge-default",icon:"📦",color:"#7A9AB8",progress:62};
@@ -188,7 +188,7 @@ useEffect(()=>{localStorage.setItem("sheetsUrl",sheetsUrl);},[sheetsUrl]);
 useEffect(()=>{localStorage.setItem("hiddenBLs",JSON.stringify(hiddenBLs));},[hiddenBLs]);
 
 const handleRemove=(bl)=>{setHiddenBLs(p=>[...p,bl]);setShipments(p=>p.filter(s=>s.bl!==bl));};
-const handleAddBL=(bl)=>{if(!shipments.find(s=>s.bl===bl))setShipments(p=>[...p,{bl,searchBL:bl.startsWith("ONEY")?bl.slice(4):bl,ctr:"",type:"",orig:"",dest:"",vessel:"",voy:"",eta:"",status:"In Transit",updated:"",note:""}]);};
+const handleAddBL=(bl)=>{if(!shipments.find(s=>s.bl===bl))setShipments(p=>[...p,{bl,searchBL:bl.startsWith("ONEY")?bl.slice(4):bl,ctr:"",type:"",orig:"",dest:"",vessel:"",voy:"",eta:"",status:"Pending Sync",updated:"Awaiting scraper",note:"Manually added — data will sync on next scraper run"}]);};
 
 const counts=shipments.reduce((acc,s)=>{acc.total++;const st=s.status;if(st==="In Transit"||st==="Departed")acc.transit++;else if(st==="At Port"||st==="Customs"||st==="Arrived")acc.port++;else if(st==="Delayed")acc.delayed++;if(st==="Delivered")acc.delivered++;return acc;},{total:0,transit:0,port:0,delayed:0,delivered:0});
 const statuses=["All Status",...new Set(shipments.map(s=>s.status))];
