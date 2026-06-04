@@ -57,6 +57,8 @@ async function fetchONELineData(cleanBL, notes) {
     lastUpdated: new Date().toISOString()
   };
   await callSearch(cleanBL, result);
+  // If container info is still missing, retry with BL_NO search type
+  if (!result.containerNo) await callSearchByBL(cleanBL, result);
   if (!result.vessel || !result.eta) await callVoyageList(cleanBL, result);
   if (!result.status || result.status === 'Pending') await callCopEvents(cleanBL, result);
   return result;
@@ -77,9 +79,27 @@ async function callSearch(cleanBL, result) {
     const j = await r.json();
     if (j.status !== 200 || !j.data || !j.data.length) return false;
     const item = j.data[0];
-    result.containerNo = item.containerNo || '';
-    const ts = item.containerTypeSize || '';
-    const wt = item.weight || '';
+
+    // --- Container No: ONE Line stores containers in cntrList[] array ---
+    // Top-level fields tried first, then nested cntrList / containers array
+    const cntrArr = item.cntrList || item.containers || item.containerList || [];
+    const cntr0   = cntrArr[0] || {};
+
+    result.containerNo =
+      item.containerNo  || item.cntrNo  || item.cntrNumber ||
+      cntr0.cntrNo      || cntr0.containerNo               ||
+      '';
+
+    // --- Container Type/Size: try both naming conventions ---
+    const ts =
+      item.containerTypeSize || item.cntrSzTpCd || item.cntrTyp  ||
+      cntr0.cntrSzTpCd       || cntr0.containerTypeSize           ||
+      cntr0.cntrTyp          || cntr0.containerType               ||
+      '';
+    const wt =
+      item.weight || item.wt ||
+      cntr0.wt    || cntr0.weight || cntr0.grossWeight ||
+      '';
     result.type = (ts && wt) ? ts + ' | ' + wt : (ts || wt);
     if (item.vesselVoyage) {
       result.vessel = item.vesselVoyage.vesselName || item.vesselVoyage.vesselEngName || '';
@@ -98,6 +118,34 @@ async function callSearch(cleanBL, result) {
     }
     return true;
   } catch(e) { console.error('search error:', e.message); return false; }
+}
+
+// Fallback: retry search with BL_NO type if BKG_NO returned no container info
+async function callSearchByBL(cleanBL, result) {
+  try {
+    const r = await fetch(ONE_BASE + '/api/v1/edh/containers/track-and-trace/search', {
+      method : 'POST',
+      headers: HDRS,
+      body   : JSON.stringify({
+        page: 1, page_length: 10,
+        filters: { search_text: cleanBL, search_type: 'BL_NO' },
+        timestamp: Date.now()
+      })
+    });
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j.status !== 200 || !j.data || !j.data.length) return;
+    const item   = j.data[0];
+    const cntrArr = item.cntrList || item.containers || item.containerList || [];
+    const cntr0   = cntrArr[0] || {};
+    if (!result.containerNo)
+      result.containerNo = item.containerNo || item.cntrNo || cntr0.cntrNo || cntr0.containerNo || '';
+    if (!result.type) {
+      const ts = item.containerTypeSize || item.cntrSzTpCd || cntr0.cntrSzTpCd || cntr0.containerTypeSize || '';
+      const wt = item.weight || item.wt || cntr0.wt || cntr0.weight || '';
+      result.type = (ts && wt) ? ts + ' | ' + wt : (ts || wt);
+    }
+  } catch(e) { console.error('searchByBL error:', e.message); }
 }
 
 async function callVoyageList(cleanBL, result) {
