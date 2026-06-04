@@ -763,7 +763,22 @@ async function refreshAllLocal() {
 // ============================================================
 function syncToSheets(record) {
   if (!SHEETS_URL) return;
-  const params = new URLSearchParams({ action:'track', bl: record.blNumber, notes: record.notes||'' });
+  // v2: use writerecord to pass all fields directly — no re-fetch needed
+  const params = new URLSearchParams({
+    action      : 'writerecord',
+    blNumber    : record.blNumber    || '',
+    searchCode  : record.searchCode  || record.blNumber || '',
+    containerNo : record.containerNo || '',
+    type        : record.type        || '',
+    origin      : record.origin      || '',
+    destination : record.destination || '',
+    vessel      : record.vessel      || '',
+    voyage      : record.voyage      || '',
+    eta         : record.eta         || '',
+    status      : record.status      || '',
+    notes       : record.notes       || '',
+    trackUrl    : record.trackUrl    || ''
+  });
   fetch(`${SHEETS_URL}?${params}`, { mode:'no-cors' }).catch(()=>{});
 }
 
