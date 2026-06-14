@@ -398,6 +398,8 @@ tbody td {
 
 .act-btn-amber { border-color: rgba(245,166,35,.3); color: var(--amber); }
 .act-btn-amber:hover { background: var(--amber-dim); color: var(--amber); }
+.act-btn-ghost { border-color: rgba(255,255,255,.2); color: rgba(255,255,255,.7); }
+.act-btn-ghost:hover { background: rgba(255,255,255,.08); color: #fff; }
 
 .act-btn-red { border-color: rgba(239,68,68,.3); color: #f87171; }
 .act-btn-red:hover { background: rgba(239,68,68,.1); color: #f87171; }
@@ -553,6 +555,14 @@ tbody td {
 
     <div class="card-body">
       <div class="form-row">
+        <div class="field" style="flex:0 0 150px">
+          <label>Carrier</label>
+          <select id="carrierSelect" onchange="onCarrierChange()"
+            style="width:100%;padding:10px;border-radius:8px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);color:inherit;font-size:14px">
+            <option value="ONE">ONE Line (live)</option>
+            <option value="WANHAI">Wan Hai (manual)</option>
+          </select>
+        </div>
         <div class="field" style="flex:3">
           <label>BL Number(s)</label>
           <input type="text" id="blInput"
@@ -567,6 +577,35 @@ tbody td {
           <button class="btn btn-amber" id="addBtn" onclick="addBL()">
             ➕ Add &amp; Track
           </button>
+        </div>
+      </div>
+
+      <!-- Wan Hai manual-entry fields (hidden unless carrier = Wan Hai) -->
+      <div id="wanhaiFields" style="display:none;margin-top:14px;padding-top:14px;border-top:1px dashed rgba(255,255,255,.12)">
+        <div style="font-size:12px;color:rgba(245,166,35,.85);margin-bottom:10px">
+          ℹ️ Wan Hai blocks automated tracking (CAPTCHA), so enter details manually.
+          <a href="https://www.wanhai.com/views/cargo_track_v2/cargo_track_list.xhtml" target="_blank"
+             style="color:var(--amber);text-decoration:underline">Open Wan Hai tracking ↗</a>
+          to look them up, then fill in below.
+        </div>
+        <div class="form-row" style="flex-wrap:wrap;gap:10px">
+          <div class="field" style="flex:1;min-width:130px"><label>Container No</label><input type="text" id="wh_container" placeholder="e.g. WHLU1234567"></div>
+          <div class="field" style="flex:1;min-width:130px"><label>Type</label><input type="text" id="wh_type" placeholder="e.g. 20'DRY"></div>
+          <div class="field" style="flex:1;min-width:130px"><label>Origin</label><input type="text" id="wh_origin" placeholder="e.g. Kaohsiung, Taiwan"></div>
+          <div class="field" style="flex:1;min-width:130px"><label>Destination</label><input type="text" id="wh_dest" placeholder="e.g. Jakarta, Indonesia"></div>
+        </div>
+        <div class="form-row" style="flex-wrap:wrap;gap:10px;margin-top:10px">
+          <div class="field" style="flex:1;min-width:130px"><label>Vessel</label><input type="text" id="wh_vessel" placeholder="Vessel name"></div>
+          <div class="field" style="flex:1;min-width:130px"><label>Voyage</label><input type="text" id="wh_voyage" placeholder="Voyage no"></div>
+          <div class="field" style="flex:1;min-width:130px"><label>ETA</label><input type="text" id="wh_eta" placeholder="e.g. 2026-06-20"></div>
+          <div class="field" style="flex:1;min-width:130px">
+            <label>Status</label>
+            <select id="wh_status" style="width:100%;padding:10px;border-radius:8px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);color:inherit;font-size:14px">
+              <option>Pending</option><option>Departed</option><option>In Transit</option>
+              <option>Arrived</option><option>At Port</option><option>Customs</option>
+              <option>Delivered</option><option>Delayed</option>
+            </select>
+          </div>
         </div>
       </div>
     </div>
@@ -587,6 +626,7 @@ tbody td {
       <table>
         <thead>
           <tr>
+            <th>Carrier</th>
             <th>BL Number</th>
             <th>Container No</th>
             <th>Type</th>
@@ -668,7 +708,83 @@ function saveUrl() {
 // ============================================================
 //  ADD BL(s)
 // ============================================================
+// ============================================================
+//  CARRIER UI TOGGLE  +  WAN HAI MANUAL ENTRY
+// ============================================================
+function onCarrierChange() {
+  const carrier = document.getElementById('carrierSelect').value;
+  const whFields = document.getElementById('wanhaiFields');
+  const blInput  = document.getElementById('blInput');
+  const addBtn   = document.getElementById('addBtn');
+  if (carrier === 'WANHAI') {
+    whFields.style.display = 'block';
+    blInput.placeholder = 'Wan Hai BL or Booking no (single)';
+    addBtn.innerHTML = '➕ Add Wan Hai';
+  } else {
+    whFields.style.display = 'none';
+    blInput.placeholder = 'e.g. TYOG45334400  (comma-separate for multiple)';
+    addBtn.innerHTML = '➕ Add &amp; Track';
+  }
+}
+
+function addWanhaiManual() {
+  const bl = document.getElementById('blInput').value.trim().toUpperCase();
+  if (!bl) { toast('⚠️ Enter a Wan Hai BL number', 'err'); return; }
+  const rec = {
+    carrier     : 'WANHAI',
+    blNumber    : bl,
+    searchCode  : bl,
+    containerNo : document.getElementById('wh_container').value.trim(),
+    type        : document.getElementById('wh_type').value.trim(),
+    origin      : document.getElementById('wh_origin').value.trim(),
+    destination : document.getElementById('wh_dest').value.trim(),
+    vessel      : document.getElementById('wh_vessel').value.trim(),
+    voyage      : document.getElementById('wh_voyage').value.trim(),
+    eta         : document.getElementById('wh_eta').value.trim(),
+    status      : document.getElementById('wh_status').value,
+    notes       : document.getElementById('notesInput').value.trim(),
+    lastUpdated : new Date().toISOString(),
+    trackUrl    : 'https://www.wanhai.com/views/cargo_track_v2/cargo_track_list.xhtml'
+  };
+  upsertLocal(rec);
+  saveLocal();
+  renderTable();
+  updateStats();
+  if (SHEETS_URL) syncToSheets(rec);   // persist Wan Hai entry to Google Sheet
+  // Clear the Wan Hai fields
+  ['blInput','notesInput','wh_container','wh_type','wh_origin','wh_dest','wh_vessel','wh_voyage','wh_eta']
+    .forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  document.getElementById('wh_status').value = 'Pending';
+  toast('✅ Wan Hai shipment added', 'ok');
+}
+
+function editWanhai(bl) {
+  const r = DATA.find(d => d.blNumber === bl);
+  if (!r) return;
+  // Preload the form with this record's values and switch to Wan Hai mode.
+  document.getElementById('carrierSelect').value = 'WANHAI';
+  onCarrierChange();
+  document.getElementById('blInput').value      = r.blNumber;
+  document.getElementById('notesInput').value   = r.notes || '';
+  document.getElementById('wh_container').value = r.containerNo || '';
+  document.getElementById('wh_type').value      = r.type || '';
+  document.getElementById('wh_origin').value    = r.origin || '';
+  document.getElementById('wh_dest').value      = r.destination || '';
+  document.getElementById('wh_vessel').value    = r.vessel || '';
+  document.getElementById('wh_voyage').value    = r.voyage || '';
+  document.getElementById('wh_eta').value        = r.eta || '';
+  if (r.status) document.getElementById('wh_status').value = r.status;
+  document.getElementById('blInput').scrollIntoView({ behavior:'smooth', block:'center' });
+  toast('✎ Editing ' + bl + ' — update fields and click Add Wan Hai', 'info');
+}
+
 async function addBL() {
+  // Route to manual Wan Hai entry when that carrier is selected.
+  if (document.getElementById('carrierSelect') &&
+      document.getElementById('carrierSelect').value === 'WANHAI') {
+    addWanhaiManual();
+    return;
+  }
   const raw   = document.getElementById('blInput').value.trim();
   const notes = document.getElementById('notesInput').value.trim();
   if (!raw) { toast('⚠️ Enter a BL number', 'err'); return; }
@@ -708,7 +824,7 @@ async function trackOne(blRaw, notes) {
 
   // Optimistic UI: show immediately as Pending
   const local = {
-    blNumber:cleanBL, searchCode:cleanBL, containerNo:'', type:'',
+    blNumber:cleanBL, searchCode:cleanBL, carrier:'ONE', containerNo:'', type:'',
     origin:'', destination:'', vessel:'', voyage:'', eta:'',
     status:'Pending', lastUpdated:new Date().toISOString(), notes, trackUrl
   };
@@ -784,7 +900,8 @@ function syncToSheets(record) {
     eta         : record.eta         || '',
     status      : record.status      || '',
     notes       : record.notes       || '',
-    trackUrl    : record.trackUrl    || ''
+    trackUrl    : record.trackUrl    || '',
+    carrier     : record.carrier     || 'ONE'
   });
   fetch(`${SHEETS_URL}?${params}`, { mode:'no-cors' }).catch(()=>{});
 }
@@ -817,7 +934,7 @@ function del(bl) {
 function renderTable() {
   const tb = document.getElementById('tBody');
   if (!DATA.length) {
-    tb.innerHTML = `<tr><td colspan="10">
+    tb.innerHTML = `<tr><td colspan="11">
       <div class="empty">
         <div class="empty-icon">🚢</div>
         <h3>No shipments tracked yet</h3>
@@ -827,8 +944,21 @@ function renderTable() {
   }
 
   tb.innerHTML = DATA.map(r => {
-    const vessel = [r.vessel, r.voyage].filter(Boolean).join(' / ') || '—';
+    const vessel  = [r.vessel, r.voyage].filter(Boolean).join(' / ') || '—';
+    const carrier = r.carrier === 'WANHAI' ? 'WANHAI' : 'ONE';
+    const carrierBadge = carrier === 'WANHAI'
+      ? `<span class="badge badge-purple">Wan Hai</span>`
+      : `<span class="badge badge-blue">ONE Line</span>`;
+    // Track link: ONE Line uses its own deep link; Wan Hai opens its tracking page.
+    const trackLink = carrier === 'WANHAI'
+      ? `<a href="https://www.wanhai.com/views/cargo_track_v2/cargo_track_list.xhtml" target="_blank" class="act-btn act-btn-amber">🔗 Wan Hai</a>`
+      : `<a href="${esc(r.trackUrl)}" target="_blank" class="act-btn act-btn-amber">🔗 ONE Line</a>`;
+    // Wan Hai rows are manual, so offer an Edit button to update them.
+    const editBtn = carrier === 'WANHAI'
+      ? `<button onclick="editWanhai('${esc(r.blNumber)}')" class="act-btn act-btn-ghost">✎ Edit</button>`
+      : '';
     return `<tr>
+      <td>${carrierBadge}</td>
       <td><span class="bl-num">${esc(r.blNumber)}</span></td>
       <td><span class="mono muted">${esc(r.containerNo)||'—'}</span></td>
       <td class="muted">${esc(r.type)||'—'}</td>
@@ -839,7 +969,8 @@ function renderTable() {
       <td>${statusBadge(r.status)}</td>
       <td class="dim">${fmtDate(r.lastUpdated)||'—'}</td>
       <td style="white-space:nowrap;display:flex;gap:6px;flex-wrap:wrap">
-        <a href="${esc(r.trackUrl)}" target="_blank" class="act-btn act-btn-amber">🔗 ONE Line</a>
+        ${trackLink}
+        ${editBtn}
         <button onclick="del('${esc(r.blNumber)}')" class="act-btn act-btn-red">✕</button>
       </td>
     </tr>`;
