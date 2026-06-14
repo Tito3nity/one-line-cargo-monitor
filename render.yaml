@@ -1,0 +1,19 @@
+# render.yaml — Render Blueprint
+# Deploy: Render Dashboard → New → Blueprint → connect this repo.
+# Render reads this file and creates the free web service automatically.
+#
+# Free tier notes:
+#   - Spins down after 15 min idle; first request after idle waits ~30-60s.
+#   - 750 instance-hours/month, no persistent disk needed (this service is stateless).
+services:
+  - type: web
+    name: one-line-tracker-api
+    runtime: node
+    plan: free
+    rootDir: server
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/track?action=ping
+    envVars:
+      - key: NODE_VERSION
+        value: "20"

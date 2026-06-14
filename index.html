@@ -613,8 +613,11 @@ tbody td {
 // ============================================================
 //  CONFIG
 // ============================================================
-// Netlify function handles live ONE Line data (no config needed)
-const TRACK_API   = '/api/track';
+// Render web service handles live ONE Line data (replaces Netlify function).
+// Set your Render URL below, or override at runtime in the browser console:
+//   localStorage.setItem('one_track_api','https://YOUR-SERVICE.onrender.com/api/track')
+const DEFAULT_TRACK_API = 'https://one-line-tracker-api.onrender.com/api/track';
+const TRACK_API = localStorage.getItem('one_track_api') || DEFAULT_TRACK_API;
 // Optional: Google Apps Script URL for Google Sheets logging
 let SHEETS_URL = localStorage.getItem('one_sheets_url') || '';
 let DATA       = JSON.parse(localStorage.getItem('one_data') || '[]');
@@ -635,7 +638,11 @@ document.addEventListener('DOMContentLoaded', () => {
   renderTable();
   updateStats();
 
-  // Auto-refresh every 5 min using Netlify function
+  // Render free tier sleeps after 15 min idle. Fire a wake-up ping on load
+  // so the service is warming up while the user reads the page.
+  fetch(`${TRACK_API}?action=ping`, { cache: 'no-cache' }).catch(() => {});
+
+  // Auto-refresh every 5 min using the tracker API
   setInterval(refreshAllLocal, 5 * 60 * 1000);
 });
 
