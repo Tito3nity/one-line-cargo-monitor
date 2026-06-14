@@ -65,13 +65,18 @@ async function getSheets() {
 async function readSheetData(sheets) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
-    range:         `${SHEET_NAME}!A2:L200`,
+    range:         `${SHEET_NAME}!A2:N200`,
   });
   const rows = res.data.values || [];
   return rows
-    .filter(r => r[0])   // skip empty rows
-    .map((r, i) => ({
-      rowIndex: i + 2,   // 1-indexed, +1 for header
+    // Tag each row with its true sheet row number FIRST (header is row 1).
+    .map((r, i) => ({ r, rowIndex: i + 2 }))
+    .filter(x => x.r[0])   // skip empty rows
+    // Skip Wan Hai rows entirely — they are entered/updated manually and must
+    // not be tracked as ONE Line BLs or have their Carrier overwritten.
+    .filter(x => !/^(wanhai|whl)/i.test((x.r[13] || "").trim()))
+    .map(({ r, rowIndex }) => ({
+      rowIndex,
       bl:       r[0]?.trim() || "",
       searchBL: r[1]?.trim() || (r[0]?.startsWith("ONEY") ? r[0].slice(4) : r[0]),
       ctr:      r[2]?.trim() || "",
@@ -134,10 +139,21 @@ async function scrapeOneLine(page, searchCode) {
 /* ─── UPDATE GOOGLE SHEET ────────────────────────────────────────────── */
 async function updateSheet(sheets, updates) {
   if (!updates.length) return;
-  const data = updates.map(u => ({
-    range:  `${SHEET_NAME}!J${u.rowIndex}:L${u.rowIndex}`,
-    values: [[u.newStatus, u.timestamp, u.note]],
-  }));
+  const data = [];
+  for (const u of updates) {
+    // Status / timestamp / note → columns J:L (unchanged behavior).
+    data.push({
+      range:  `${SHEET_NAME}!J${u.rowIndex}:L${u.rowIndex}`,
+      values: [[u.newStatus, u.timestamp, u.note]],
+    });
+    // Carrier → column N. This scraper only handles ONE Line BLs, so every
+    // row it updates is "ONE". (Wan Hai rows are entered manually and are not
+    // processed here, so they are never overwritten.)
+    data.push({
+      range:  `${SHEET_NAME}!N${u.rowIndex}`,
+      values: [["ONE"]],
+    });
+  }
   await sheets.spreadsheets.values.batchUpdate({
     spreadsheetId: SHEET_ID,
     resource: { valueInputOption: "RAW", data },
