@@ -70,7 +70,7 @@ app.get('/api/track', async (req, res) => {
 async function fetchONELineData(cleanBL, notes) {
   const result = {
     blNumber: cleanBL, searchCode: cleanBL, containerNo: '', type: '',
-    origin: '', destination: '', vessel: '', voyage: '', eta: '',
+    origin: '', destination: '', vessel: '', voyage: '', eta: '', etd: '',
     status: 'Pending', notes,
     trackUrl: ONE_BASE + '/one-ecom/manage-shipment/cargo-tracking?trakNoParam=' + cleanBL + '&trakNoTpCdParam=B',
     lastUpdated: new Date().toISOString()
@@ -78,7 +78,8 @@ async function fetchONELineData(cleanBL, notes) {
   await callSearch(cleanBL, result);
   if (!result.containerNo)             await callSearchByBL(cleanBL, result);
   if (!result.vessel || !result.eta)   await callVoyageList(cleanBL, result);
-  if (!result.status || result.status === 'Pending') await callCopEvents(cleanBL, result);
+  // Always call cop-events: it supplies status AND the POL/Vessel Departure (ETD) date
+  if (!result.status || result.status === 'Pending' || !result.etd) await callCopEvents(cleanBL, result);
   return result;
 }
 
@@ -122,8 +123,11 @@ async function callSearch(cleanBL, result) {
     if (item.deadlineEvents && item.deadlineEvents.length) {
       const etaEv = item.deadlineEvents.find(e => /eta|arrival|berth/i.test(e.eventType || ''));
       if (etaEv) result.eta = etaEv.date || etaEv.eventDate || '';
+      const etdEv = item.deadlineEvents.find(e => /depart|sailing|loaded on vessel|pol/i.test((e.eventType || '') + ' ' + (e.eventName || '')));
+      if (etdEv) result.etd = etdEv.date || etdEv.eventDate || '';
     }
     if (!result.eta && item.pod) result.eta = item.pod.eta || item.pod.arrivalDate || '';
+    if (!result.etd && item.por) result.etd = item.por.etd || item.por.departureDate || item.por.actualDepartureDate || '';
     if (item.latestEvent) {
       const evName = item.latestEvent.eventName || '';
       result.status = STATUS_MAP[evName] || evName || 'Active';
@@ -180,9 +184,28 @@ async function callCopEvents(cleanBL, result) {
     if (!r.ok) return;
     const j = await r.json();
     if (j.status !== 200 || !j.data || !j.data.length) return;
+
+    // Status from the most recent event (unchanged behaviour)
     const last   = j.data[j.data.length - 1];
     const evName = last.eventName || last.eventCd || '';
-    result.status = STATUS_MAP[evName] || evName || 'Active';
+    if (!result.status || result.status === 'Pending')
+      result.status = STATUS_MAP[evName] || evName || 'Active';
+
+    // POL / Vessel Departure date -> ETD (column S). Match the departure event
+    // by name and read its actual (preferred) or estimated date.
+    if (!result.etd) {
+      const depEv = j.data.find(e => {
+        const n = (e.eventName || e.eventCd || '').toLowerCase();
+        return n.includes('vessel departure from port of loading') ||
+               n.includes('departure from port of loading') ||
+               (n.includes('depart') && n.includes('loading')) ||
+               n.includes('loaded on vessel at port of loading');
+      });
+      if (depEv) {
+        result.etd = depEv.actualDate || depEv.eventDate || depEv.actualEventDate ||
+                     depEv.date || depEv.actualTime || depEv.eventDt || '';
+      }
+    }
   } catch (e) { console.error('cop-events error:', e.message); }
 }
 
