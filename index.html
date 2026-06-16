@@ -897,7 +897,7 @@ function syncToSheets(record) {
     destination : record.destination || '',
     vessel      : record.vessel      || '',
     voyage      : record.voyage      || '',
-    eta         : record.eta         || '',
+    eta         : (record.eta || '').split('T')[0],  // date-only for sheet (strip ISO time)
     status      : record.status      || '',
     notes       : record.notes       || '',
     trackUrl    : record.trackUrl    || '',
