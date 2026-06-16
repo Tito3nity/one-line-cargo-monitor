@@ -11,6 +11,7 @@
 // this code must run on a server such as Render.
 
 const express = require('express');
+const { trackWanHai } = require('./wanhai');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -48,6 +49,41 @@ app.use((req, res, next) => {
 
 app.get('/', (req, res) => {
   res.type('text/plain').send('ONE Line Tracker API — OK. Use /api/track?action=track&bl=BLNUMBER');
+});
+
+// Wan Hai live tracking — mirrors /api/track's response shape so the
+// dashboard can treat WHL exactly like ONE Line (live, no manual entry).
+app.get('/api/wanhai', async (req, res) => {
+  const action = (req.query.action || 'track').toLowerCase();
+  const bl     = (req.query.bl || '').trim();
+  if (action === 'ping') return res.json({ ok: true });
+  if (!bl)               return res.status(400).json({ error: 'bl required' });
+  try {
+    const w = await trackWanHai(bl.toUpperCase(), 'MFT');
+    // Normalise to the same field names the ONE route returns.
+    const result = {
+      blNumber    : w.blNo || bl.toUpperCase(),
+      searchCode  : w.blNo || bl.toUpperCase(),
+      containerNo : w.containerNo || '',
+      type        : (w.containerType && w.containers && w.containers[0] && w.containers[0].packageCargoWeight)
+                      ? w.containerType + ' | ' + w.containers[0].packageCargoWeight
+                      : (w.containerType || ''),
+      origin      : w.placeOfReceipt || w.portOfLoading || '',
+      destination : w.placeOfDelivery || w.portOfDischarging || '',
+      vessel      : w.vesselName || '',
+      voyage      : w.voyage || '',
+      etd         : w.etd || '',
+      eta         : w.eta || '',
+      status      : w.latestStatus || 'In Transit',
+      notes       : req.query.notes || '',
+      carrier     : 'WANHAI',
+      trackUrl    : w.sourceUrl || 'https://www.wanhai.com/views/cargo_track_v2/cargo_track_list.xhtml',
+      lastUpdated : w.fetchedAt || new Date().toISOString()
+    };
+    res.json(result);
+  } catch (err) {
+    res.json({ error: err.message, status: 'Pending', blNumber: bl, carrier: 'WANHAI' });
+  }
 });
 
 app.get('/api/track', async (req, res) => {
