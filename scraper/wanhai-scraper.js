@@ -239,8 +239,9 @@ async function runWanHaiScraper() {
   // Find WHL rows (column N index 13). rowNumber is 1-based incl. header.
   const targets = [];
   for (let i = 1; i < rows.length; i++) {
-    const carrier = (rows[i][13] || '').trim().toUpperCase();
-    const bl = (rows[i][0] || rows[i][1] || '').trim();
+    const row = rows[i] || [];
+    const carrier = (row[13] || row[row.length - 1] || '').toString().trim().toUpperCase();
+    const bl = (row[0] || row[1] || '').toString().trim();
     if (carrier === CARRIER_TAG && bl) targets.push({ rowNumber: i + 1, bl });
   }
   if (!targets.length) {
