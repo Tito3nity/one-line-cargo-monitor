@@ -658,6 +658,8 @@ tbody td {
 //   localStorage.setItem('one_track_api','https://YOUR-SERVICE.onrender.com/api/track')
 const DEFAULT_TRACK_API = 'https://one-line-tracker-api.onrender.com/api/track';
 const TRACK_API = localStorage.getItem('one_track_api') || DEFAULT_TRACK_API;
+// Wan Hai live endpoint lives on the same Render service, route /api/wanhai.
+const WANHAI_API = TRACK_API.replace(/\/api\/track$/, '/api/wanhai');
 // Optional: Google Apps Script URL for Google Sheets logging
 let SHEETS_URL = localStorage.getItem('one_sheets_url') || '';
 let DATA       = JSON.parse(localStorage.getItem('one_data') || '[]');
@@ -717,9 +719,9 @@ function onCarrierChange() {
   const blInput  = document.getElementById('blInput');
   const addBtn   = document.getElementById('addBtn');
   if (carrier === 'WANHAI') {
-    whFields.style.display = 'block';
-    blInput.placeholder = 'Wan Hai BL or Booking no (single)';
-    addBtn.innerHTML = '➕ Add Wan Hai';
+    whFields.style.display = 'none';
+    blInput.placeholder = 'Wan Hai BL or Booking no (live)';
+    addBtn.innerHTML = ' Add &amp; Track';
   } else {
     whFields.style.display = 'none';
     blInput.placeholder = 'e.g. TYOG45334400  (comma-separate for multiple)';
@@ -779,12 +781,9 @@ function editWanhai(bl) {
 }
 
 async function addBL() {
-  // Route to manual Wan Hai entry when that carrier is selected.
-  if (document.getElementById('carrierSelect') &&
-      document.getElementById('carrierSelect').value === 'WANHAI') {
-    addWanhaiManual();
-    return;
-  }
+  // Wan Hai is now LIVE (Render /api/wanhai), tracked just like ONE Line.
+  const isWanhai = document.getElementById('carrierSelect') &&
+                   document.getElementById('carrierSelect').value === 'WANHAI';
   const raw   = document.getElementById('blInput').value.trim();
   const notes = document.getElementById('notesInput').value.trim();
   if (!raw) { toast('⚠️ Enter a BL number', 'err'); return; }
@@ -798,7 +797,7 @@ async function addBL() {
 
   for (const bl of bls) {
     try {
-      await trackOne(bl, notes);
+      await (isWanhai ? trackWanhaiLive(bl, notes) : trackOne(bl, notes));
       ok++;
     } catch(e) {
       fail++;
@@ -816,6 +815,35 @@ async function addBL() {
 
   renderTable();
   updateStats();
+}
+
+async function trackWanhaiLive(blRaw, notes) {
+  const cleanBL  = blRaw.trim().toUpperCase();
+  const trackUrl = 'https://www.wanhai.com/views/cargo_track_v2/cargo_track_list.xhtml';
+  const local = {
+    blNumber:cleanBL, searchCode:cleanBL, carrier:'WANHAI', containerNo:'', type:'',
+    origin:'', destination:'', vessel:'', voyage:'', eta:'',
+    status:'Pending', lastUpdated:new Date().toISOString(), notes, trackUrl
+  };
+  upsertLocal(local);
+  saveLocal();
+  renderTable();
+  try {
+    const res = await fetch(
+      `${WANHAI_API}?action=track&bl=${encodeURIComponent(cleanBL)}&notes=${encodeURIComponent(notes)}`,
+      { cache: 'no-cache' }
+    );
+    if (res.ok) {
+      const data = await res.json();
+      if (data && !data.error) {
+        upsertLocal({ ...data, carrier:'WANHAI', notes });
+        saveLocal();
+        renderTable();
+        updateStats();
+        if (SHEETS_URL) syncToSheets({ ...data, carrier:'WANHAI', notes });
+      }
+    }
+  } catch(e) { console.warn('trackWanhaiLive error:', e); }
 }
 
 async function trackOne(blRaw, notes) {
@@ -861,8 +889,9 @@ async function refreshAllLocal() {
   if (!DATA.length) return;
   for (const rec of DATA) {
     try {
+      const ep = (rec.carrier === 'WANHAI') ? WANHAI_API : TRACK_API;
       const res = await fetch(
-        `${TRACK_API}?action=track&bl=${encodeURIComponent(rec.blNumber)}&notes=${encodeURIComponent(rec.notes||'')}`,
+        `${ep}?action=track&bl=${encodeURIComponent(rec.blNumber)}&notes=${encodeURIComponent(rec.notes||'')}`,
         { cache: 'no-cache' }
       );
       if (res.ok) {
