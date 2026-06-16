@@ -828,22 +828,17 @@ async function trackWanhaiLive(blRaw, notes) {
   upsertLocal(local);
   saveLocal();
   renderTable();
-  try {
-    const res = await fetch(
-      `${WANHAI_API}?action=track&bl=${encodeURIComponent(cleanBL)}&notes=${encodeURIComponent(notes)}`,
-      { cache: 'no-cache' }
-    );
-    if (res.ok) {
-      const data = await res.json();
-      if (data && !data.error) {
-        upsertLocal({ ...data, carrier:'WANHAI', notes });
-        saveLocal();
-        renderTable();
-        updateStats();
-        if (SHEETS_URL) syncToSheets({ ...data, carrier:'WANHAI', notes });
-      }
-    }
-  } catch(e) { console.warn('trackWanhaiLive error:', e); }
+  // Wan Hai blocks cloud/datacenter IPs, so we can't scrape it from Render.
+  // Instead we register the BL in the Google Sheet (carrier=WANHAI); the
+  // GitHub Actions Puppeteer scraper (scheduled + on-demand) fills in the
+  // live details from a non-blocked runner IP and writes them back. The
+  // dashboard then shows them on the next refresh.
+  updateStats();
+  if (SHEETS_URL) {
+    syncToSheets({ ...local });
+  } else {
+    toast('Enable Google Sheets sync so the Wan Hai scraper can fill this BL', 'info');
+  }
 }
 
 async function trackOne(blRaw, notes) {
@@ -888,8 +883,10 @@ async function trackOne(blRaw, notes) {
 async function refreshAllLocal() {
   if (!DATA.length) return;
   for (const rec of DATA) {
+    // Wan Hai rows are maintained by the GitHub Actions scraper (Render is IP-blocked).
+    if (rec.carrier === 'WANHAI') continue;
     try {
-      const ep = (rec.carrier === 'WANHAI') ? WANHAI_API : TRACK_API;
+      const ep = TRACK_API;
       const res = await fetch(
         `${ep}?action=track&bl=${encodeURIComponent(rec.blNumber)}&notes=${encodeURIComponent(rec.notes||'')}`,
         { cache: 'no-cache' }
