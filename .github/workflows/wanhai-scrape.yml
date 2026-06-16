@@ -1,0 +1,36 @@
+name: Wan Hai Daily Cargo Tracker
+
+on:
+  schedule:
+    # Same cadence as the ONE Line tracker (01:00 UTC = 08:00 WIB), offset by
+    # 10 minutes so the two scrapers don't write to the sheet simultaneously.
+    - cron: '10 1 * * *'
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install scraper dependencies
+        working-directory: ./scraper
+        run: npm install
+
+      - name: Install Chromium
+        run: npx puppeteer browsers install chrome
+
+      - name: Run Wan Hai cargo tracker
+        working-directory: ./scraper
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
+        run: node wanhai-scraper.js
