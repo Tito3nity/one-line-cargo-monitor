@@ -993,7 +993,7 @@ function statusBadge(s) {
 function updateStats() {
   document.getElementById('s-total').textContent   = DATA.length;
   document.getElementById('s-transit').textContent = DATA.filter(d=>/transit|sailing|departed|on.board/i.test(d.status||'')).length;
-  document.getElementById('s-arrived').textContent = DATA.filter(d=>/arriv|discharg|delivered/i.test(d.status||'')).length;
+  document.getElementById('s-arrived').textContent = DATA.filter(d=>/arriv|discharg|delivered|complete|finish/i.test(d.status||'')).length;
   document.getElementById('s-pending').textContent = DATA.filter(d=>!d.status||/pending|syncing/i.test(d.status)).length;
 }
 
