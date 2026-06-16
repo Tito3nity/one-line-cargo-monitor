@@ -99,7 +99,29 @@ async function getRedirectContext(refNo, refType) {
 
 // --- step 2: POST to resolve to the result page ----------------------------
 
+// Primary path: the redirect endpoint now resolves server-side straight to the
+// fully-rendered result page (tracking_data_page_by_bl.xhtml). Just follow it.
+// Falls back to the older ViewState/POST flow if no result tables are present.
 async function fetchResultHtml(refNo, refType) {
+  const url =
+    REDIRECT_EP +
+    "?ref_no=" + encodeURIComponent(refNo) +
+    "&ref_type=" + encodeURIComponent(refType);
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { "User-Agent": UA, Accept: "text/html" },
+      redirect: "follow",
+    });
+    const html = await res.text();
+    if (/tbl-list/.test(html) || /tracking_data_page_by_bl\.xhtml/.test(res.url)) {
+      return { html, finalUrl: res.url };
+    }
+  } catch (e) { /* fall through to POST flow */ }
+  return fetchResultHtmlViaPost(refNo, refType);
+}
+
+async function fetchResultHtmlViaPost(refNo, refType) {
   const ctx = await getRedirectContext(refNo, refType);
   if (!ctx.viewState || !ctx.cmdId) {
     throw new Error(
