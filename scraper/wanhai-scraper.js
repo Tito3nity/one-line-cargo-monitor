@@ -32,7 +32,7 @@ async function scrapeWanHai(browser, bl) {
 
   let listPage = null;
   try {
-    await page.goto(QUERY_PAGE, { waitUntil: 'networkidle2' });
+    await page.goto(QUERY_PAGE, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('#q_ref_no1', { timeout: 20000 });
 
     await page.evaluate((refNo) => {
