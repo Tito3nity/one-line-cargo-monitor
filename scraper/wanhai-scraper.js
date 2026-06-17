@@ -65,11 +65,38 @@ function parseFromTables(rowsByTable, ref) {
     return '';
   };
 
+  // LIST-VIEW (columnar) reader: the "Tracking Information List" has a header
+  // row [BL no. | Oboard Date | Voyage | Vessel Name | More detail] and a data
+  // row below it. VERIFIED LIVE for 025G657555 -> 2026/06/01 | S015 | GSL MAMITSA.
+  // findVal (label-then-adjacent-cell) can't read this, so handle it explicitly.
+  const fromList = { bl: '', onboard: '', voyage: '', vessel: '' };
+  for (const rows of rowsByTable) {
+    const hi = rows.findIndex((r) =>
+      r.some((c) => /vessel name/i.test(c)) && r.some((c) => /voyage/i.test(c)));
+    if (hi === -1) continue;
+    const header = rows[hi];
+    const col = (re) => header.findIndex((h) => re.test(h));
+    const iBl = col(/BL no/i), iOb = col(/board date/i),
+          iVoy = col(/voyage/i), iVes = col(/vessel name/i);
+    for (let r = hi + 1; r < rows.length; r++) {
+      const row = rows[r];
+      const blCell = iBl >= 0 ? (row[iBl] || '') : '';
+      if (blCell && blCell.toUpperCase().includes(ref.toUpperCase())) {
+        fromList.bl      = blCell.trim();
+        fromList.onboard = iOb  >= 0 ? (row[iOb]  || '').trim() : '';
+        fromList.voyage  = iVoy >= 0 ? (row[iVoy] || '').trim() : '';
+        fromList.vessel  = iVes >= 0 ? (row[iVes] || '').trim() : '';
+        break;
+      }
+    }
+    if (fromList.vessel || fromList.voyage) break;
+  }
+
   const rec = {
-    blNumber:    findVal(/^BL no\.?$/i) || ref,
-    vessel:      findVal(/Vessel Name/i),
-    voyage:      findVal(/^Voyage$/i),
-    onboardDate: findVal(/board Date|Oboard Date/i),
+    blNumber:    fromList.bl     || findVal(/^BL no\.?$/i) || ref,
+    vessel:      fromList.vessel || findVal(/Vessel Name/i),
+    voyage:      fromList.voyage || findVal(/^Voyage$/i),
+    onboardDate: fromList.onboard|| findVal(/board Date|Oboard Date/i),
     origin:      '',
     destination: '',
     eta:         '',
@@ -124,18 +151,24 @@ function parseFromTables(rowsByTable, ref) {
   return rec;
 }
 
-// Read every table.tbl-list on whatever page object we pass in.
+// Read tables on the page. Prefer table.tbl-list (detail view) but fall back to
+// ALL tables, because the "Tracking Information List" result is a plain <table>
+// (VERIFIED LIVE) with header row BL/Oboard Date/Voyage/Vessel Name/More detail.
 async function readTables(target) {
   return target.evaluate(() => {
     const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
-    const out = [];
-    for (const tbl of document.querySelectorAll('table.tbl-list')) {
-      const rows = [...tbl.querySelectorAll('tr')].map((tr) =>
-        [...tr.querySelectorAll('td,th')].map((td) => clean(td.innerText))
-      );
-      if (rows.some((r) => r.some((c) => c.length))) out.push(rows);
-    }
-    return out;
+    const grab = (sel) => {
+      const out = [];
+      for (const tbl of document.querySelectorAll(sel)) {
+        const rows = [...tbl.querySelectorAll('tr')].map((tr) =>
+          [...tr.querySelectorAll('td,th')].map((td) => clean(td.innerText))
+        );
+        if (rows.some((r) => r.some((c) => c.length))) out.push(rows);
+      }
+      return out;
+    };
+    const listed = grab('table.tbl-list');
+    return listed.length ? listed : grab('table');
   });
 }
 
@@ -167,6 +200,13 @@ async function attemptForm(browser, ref) {
     await page.waitForSelector('#q_ref_no1, input[id*="ref_no"]', { timeout: 20000 });
 
     await page.evaluate((refNo) => {
+      // Force the result to render IN THIS TAB. The live form is
+      // method=post target=_blank; in headless Puppeteer catching that popup is
+      // racy, but overriding target to _self makes the POST navigate this page
+      // straight to the result (VERIFIED LIVE: resolves to
+      // tracking_data_list.xhtml?file_num=...&top_file_num=...&parent_id=...).
+      const form = document.querySelector('form');
+      if (form) form.target = '_self';
       // Choose "BL no." in the cargo-type selector if present.
       const sel = document.getElementById('cargoType') ||
                   document.querySelector('select[id*="cargoType"]');
@@ -179,49 +219,43 @@ async function attemptForm(browser, ref) {
       if (inp) { inp.value = refNo; inp.dispatchEvent(new Event('input', { bubbles: true })); }
     }, ref);
 
-    // LIVE-VERIFIED behaviour: the Query form is method=post target=_blank, so
-    // the result opens in a NEW top-level tab. We catch it two ways and take
-    // whichever fires first: (a) the targetcreated event, (b) polling
-    // browser.pages() for a freshly-opened tracking_data tab (guards the race
-    // where the event fires before our listener attaches).
-    const knownBefore = new Set((await browser.pages()).map((p) => p));
-    const popupPromise = new Promise((resolve) => {
-      const onTarget = async (t) => { try { resolve(await t.page()); } catch { resolve(null); } };
-      browser.once('targetcreated', onTarget);
-      setTimeout(() => resolve(null), 14000);
-    });
-    const pollPromise = (async () => {
-      for (let i = 0; i < 28; i++) {                 // ~14s @ 500ms
+    // Secondary safety net: if a popup still opens (target override didn't take),
+    // capture it by polling browser.pages() for a tracking_data_list tab.
+    const knownBefore = new Set(await browser.pages());
+
+    // Submit and wait for the same-tab navigation to the result list page.
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
+      page.evaluate(() => {
+        const b = document.getElementById('quick_ctnr_query') ||
+                  document.querySelector('[id*="query"],button[type="submit"],input[type="submit"]');
+        if (b) b.click();
+      }),
+    ]);
+
+    // Resolve the result target: this page if it navigated to a result URL,
+    // otherwise a freshly-opened popup tab.
+    let target = page;
+    const isResult = (u) => /tracking_data_list\.xhtml|tracking_data_page_by_bl\.xhtml/i.test(u || '');
+    if (!isResult(page.url())) {
+      for (let i = 0; i < 20 && !isResult(target.url()); i++) {   // up to ~10s for a popup
         await new Promise((r) => setTimeout(r, 500));
         for (const p of await browser.pages()) {
           if (knownBefore.has(p)) continue;
-          const u = p.url() || '';
-          if (/tracking_data|cargo_track/i.test(u) && !/cargo_tracking\.xhtml$/i.test(u)) return p;
+          if (isResult(p.url())) { target = p; break; }
         }
       }
-      return null;
-    })();
-
-    await page.evaluate(() => {
-      const b = document.getElementById('quick_ctnr_query') ||
-                document.querySelector('[id*="query"],button[type="submit"],input[type="submit"]');
-      if (b) b.click();
-    });
-
-    popup = await Promise.race([popupPromise, pollPromise]);
-    if (!popup) popup = await pollPromise;           // give the poller its full window
-    const target = popup || page;
-    if (target && target !== page) {
-      await target.bringToFront().catch(() => {});
-      // The result tab itself renders tables asynchronously after a "loading..."
-      // shell, so wait for real content rather than just navigation.
+      if (target !== page) { popup = target; await target.bringToFront().catch(() => {}); }
     }
 
+    if (ERROR_PAGE_RE.test(target.url())) throw new Error('result bounced to error page');
+
+    // The list table renders quickly, but wait for actual content to be safe.
     await target
       .waitForFunction(
-        () => document.querySelector('table.tbl-list') &&
+        () => document.querySelector('table') &&
               /vessel name|bl no\.|ctnr no/i.test(document.body.innerText),
-        { timeout: 35000, polling: 500 }       // result tab shows "loading..." first
+        { timeout: 30000, polling: 500 }
       )
       .catch(() => {});
 
