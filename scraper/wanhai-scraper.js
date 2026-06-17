@@ -351,7 +351,18 @@ const CARRIER_TAG = 'WANHAI';
 
 async function getSheetsClient() {
   const { google } = require('googleapis');
-  const creds = JSON.parse(process.env.GOOGLE_CREDS);
+  // GOOGLE_CREDS may be raw JSON or base64-encoded JSON. Match the working ONE
+  // Line scraper exactly: if it starts with "{" treat it as raw, otherwise
+  // base64-decode first. (The repo's secret is base64-encoded.)
+  const raw = process.env.GOOGLE_CREDS || '';
+  let creds;
+  try {
+    creds = JSON.parse(raw.trim().startsWith('{')
+      ? raw
+      : Buffer.from(raw, 'base64').toString('utf-8'));
+  } catch (e) {
+    throw new Error('GOOGLE_CREDS is missing or not valid JSON/base64: ' + e.message);
+  }
   const auth = new google.auth.GoogleAuth({
     credentials: creds,
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
