@@ -560,7 +560,7 @@ tbody td {
           <select id="carrierSelect" onchange="onCarrierChange()"
             style="width:100%;padding:10px;border-radius:8px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);color:inherit;font-size:14px">
             <option value="ONE">ONE Line (live)</option>
-            <option value="WANHAI">Wan Hai (manual)</option>
+            <option value="WANHAI">Wan Hai (auto-scraped)</option>
           </select>
         </div>
         <div class="field" style="flex:3">
@@ -580,32 +580,17 @@ tbody td {
         </div>
       </div>
 
-      <!-- Wan Hai manual-entry fields (hidden unless carrier = Wan Hai) -->
+      <!-- Wan Hai note (shown when carrier = Wan Hai). No manual entry: the BL is
+           registered in the Google Sheet and the GitHub Actions Puppeteer scraper
+           fills in live vessel/voyage/container/ETA on its schedule (and you can
+           trigger it on demand). The dashboard then reads it straight from the Sheet. -->
       <div id="wanhaiFields" style="display:none;margin-top:14px;padding-top:14px;border-top:1px dashed rgba(255,255,255,.12)">
-        <div style="font-size:12px;color:rgba(245,166,35,.85);margin-bottom:10px">
-          ℹ️ Wan Hai blocks automated tracking (CAPTCHA), so enter details manually.
-          <a href="https://www.wanhai.com/views/cargo_track_v2/cargo_track_list.xhtml" target="_blank"
+        <div style="font-size:12px;color:rgba(245,166,35,.85)">
+          ℹ️ Wan Hai is tracked automatically. Just add the BL number above — it is registered in your
+          Google Sheet and the scheduled scraper fills in the live details (vessel, voyage, container, ETA).
+          The dashboard reads those straight from the Sheet, so it stays fresh even when Wan Hai's own
+          session expires. <a href="https://www.wanhai.com/views/quick/cargo_tracking.xhtml" target="_blank"
              style="color:var(--amber);text-decoration:underline">Open Wan Hai tracking ↗</a>
-          to look them up, then fill in below.
-        </div>
-        <div class="form-row" style="flex-wrap:wrap;gap:10px">
-          <div class="field" style="flex:1;min-width:130px"><label>Container No</label><input type="text" id="wh_container" placeholder="e.g. WHLU1234567"></div>
-          <div class="field" style="flex:1;min-width:130px"><label>Type</label><input type="text" id="wh_type" placeholder="e.g. 20'DRY"></div>
-          <div class="field" style="flex:1;min-width:130px"><label>Origin</label><input type="text" id="wh_origin" placeholder="e.g. Kaohsiung, Taiwan"></div>
-          <div class="field" style="flex:1;min-width:130px"><label>Destination</label><input type="text" id="wh_dest" placeholder="e.g. Jakarta, Indonesia"></div>
-        </div>
-        <div class="form-row" style="flex-wrap:wrap;gap:10px;margin-top:10px">
-          <div class="field" style="flex:1;min-width:130px"><label>Vessel</label><input type="text" id="wh_vessel" placeholder="Vessel name"></div>
-          <div class="field" style="flex:1;min-width:130px"><label>Voyage</label><input type="text" id="wh_voyage" placeholder="Voyage no"></div>
-          <div class="field" style="flex:1;min-width:130px"><label>ETA</label><input type="text" id="wh_eta" placeholder="e.g. 2026-06-20"></div>
-          <div class="field" style="flex:1;min-width:130px">
-            <label>Status</label>
-            <select id="wh_status" style="width:100%;padding:10px;border-radius:8px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);color:inherit;font-size:14px">
-              <option>Pending</option><option>Departed</option><option>In Transit</option>
-              <option>Arrived</option><option>At Port</option><option>Customs</option>
-              <option>Delivered</option><option>Delayed</option>
-            </select>
-          </div>
         </div>
       </div>
     </div>
@@ -658,9 +643,10 @@ tbody td {
 //   localStorage.setItem('one_track_api','https://YOUR-SERVICE.onrender.com/api/track')
 const DEFAULT_TRACK_API = 'https://one-line-tracker-api.onrender.com/api/track';
 const TRACK_API = localStorage.getItem('one_track_api') || DEFAULT_TRACK_API;
-// Wan Hai live endpoint lives on the same Render service, route /api/wanhai.
-const WANHAI_API = TRACK_API.replace(/\/api\/track$/, '/api/wanhai');
-// Optional: Google Apps Script URL for Google Sheets logging
+// Google Apps Script /exec URL. Used for BOTH writing (writerecord) and, now,
+// READING the sheet back (action=list). The sheet is the source of truth — it
+// is where the GitHub Actions Wan Hai scraper writes its results, so reading it
+// back is how Wan Hai data appears on the dashboard without any manual entry.
 let SHEETS_URL = localStorage.getItem('one_sheets_url') || '';
 let DATA       = JSON.parse(localStorage.getItem('one_data') || '[]');
 
@@ -684,8 +670,14 @@ document.addEventListener('DOMContentLoaded', () => {
   // so the service is warming up while the user reads the page.
   fetch(`${TRACK_API}?action=ping`, { cache: 'no-cache' }).catch(() => {});
 
-  // Auto-refresh every 5 min using the tracker API
+  // Pull the Google Sheet immediately so scraper-filled Wan Hai rows (and any
+  // updates made on another device) appear right away.
+  if (SHEETS_URL) pullFromSheet();
+
+  // Auto-refresh every 5 min: re-fetch ONE Line live AND re-pull the sheet
+  // (which carries the latest Wan Hai scraper results).
   setInterval(refreshAllLocal, 5 * 60 * 1000);
+  setInterval(() => { if (SHEETS_URL) pullFromSheet(); }, 5 * 60 * 1000);
 });
 
 function tick() {
@@ -719,65 +711,14 @@ function onCarrierChange() {
   const blInput  = document.getElementById('blInput');
   const addBtn   = document.getElementById('addBtn');
   if (carrier === 'WANHAI') {
-    whFields.style.display = 'none';
-    blInput.placeholder = 'Wan Hai BL or Booking no (live)';
-    addBtn.innerHTML = ' Add &amp; Track';
+    whFields.style.display = 'block';               // show the auto-scrape note
+    blInput.placeholder = 'Wan Hai BL or Booking no — e.g. 025G657555';
+    addBtn.innerHTML = '➕ Add &amp; Track';
   } else {
     whFields.style.display = 'none';
     blInput.placeholder = 'e.g. TYOG45334400  (comma-separate for multiple)';
     addBtn.innerHTML = '➕ Add &amp; Track';
   }
-}
-
-function addWanhaiManual() {
-  const bl = document.getElementById('blInput').value.trim().toUpperCase();
-  if (!bl) { toast('⚠️ Enter a Wan Hai BL number', 'err'); return; }
-  const rec = {
-    carrier     : 'WANHAI',
-    blNumber    : bl,
-    searchCode  : bl,
-    containerNo : document.getElementById('wh_container').value.trim(),
-    type        : document.getElementById('wh_type').value.trim(),
-    origin      : document.getElementById('wh_origin').value.trim(),
-    destination : document.getElementById('wh_dest').value.trim(),
-    vessel      : document.getElementById('wh_vessel').value.trim(),
-    voyage      : document.getElementById('wh_voyage').value.trim(),
-    eta         : document.getElementById('wh_eta').value.trim(),
-    status      : document.getElementById('wh_status').value,
-    notes       : document.getElementById('notesInput').value.trim(),
-    lastUpdated : new Date().toISOString(),
-    trackUrl    : 'https://www.wanhai.com/views/cargo_track_v2/cargo_track_list.xhtml'
-  };
-  upsertLocal(rec);
-  saveLocal();
-  renderTable();
-  updateStats();
-  if (SHEETS_URL) syncToSheets(rec);   // persist Wan Hai entry to Google Sheet
-  // Clear the Wan Hai fields
-  ['blInput','notesInput','wh_container','wh_type','wh_origin','wh_dest','wh_vessel','wh_voyage','wh_eta']
-    .forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
-  document.getElementById('wh_status').value = 'Pending';
-  toast('✅ Wan Hai shipment added', 'ok');
-}
-
-function editWanhai(bl) {
-  const r = DATA.find(d => d.blNumber === bl);
-  if (!r) return;
-  // Preload the form with this record's values and switch to Wan Hai mode.
-  document.getElementById('carrierSelect').value = 'WANHAI';
-  onCarrierChange();
-  document.getElementById('blInput').value      = r.blNumber;
-  document.getElementById('notesInput').value   = r.notes || '';
-  document.getElementById('wh_container').value = r.containerNo || '';
-  document.getElementById('wh_type').value      = r.type || '';
-  document.getElementById('wh_origin').value    = r.origin || '';
-  document.getElementById('wh_dest').value      = r.destination || '';
-  document.getElementById('wh_vessel').value    = r.vessel || '';
-  document.getElementById('wh_voyage').value    = r.voyage || '';
-  document.getElementById('wh_eta').value        = r.eta || '';
-  if (r.status) document.getElementById('wh_status').value = r.status;
-  document.getElementById('blInput').scrollIntoView({ behavior:'smooth', block:'center' });
-  toast('✎ Editing ' + bl + ' — update fields and click Add Wan Hai', 'info');
 }
 
 async function addBL() {
@@ -810,8 +751,9 @@ async function addBL() {
   document.getElementById('blInput').value = '';
   document.getElementById('notesInput').value = '';
 
-  if (ok)   toast(`✅ ${ok} BL${ok>1?'s':''} tracked via ONE Line!`, 'ok');
-  if (fail) toast(`⚠️ ${fail} BL${fail>1?'s':''} saved as Pending — will retry on refresh`, 'info');
+  if (ok && isWanhai)  toast(`✅ ${ok} Wan Hai BL${ok>1?'s':''} registered — scraper will fill live details`, 'ok');
+  else if (ok)         toast(`✅ ${ok} BL${ok>1?'s':''} tracked via ONE Line!`, 'ok');
+  if (fail)            toast(`⚠️ ${fail} BL${fail>1?'s':''} saved as Pending — will retry on refresh`, 'info');
 
   renderTable();
   updateStats();
@@ -819,7 +761,7 @@ async function addBL() {
 
 async function trackWanhaiLive(blRaw, notes) {
   const cleanBL  = blRaw.trim().toUpperCase();
-  const trackUrl = 'https://www.wanhai.com/views/cargo_track_v2/cargo_track_list.xhtml';
+  const trackUrl = 'https://www.wanhai.com/views/quick/cargo_tracking.xhtml';
   const local = {
     blNumber:cleanBL, searchCode:cleanBL, carrier:'WANHAI', containerNo:'', type:'',
     origin:'', destination:'', vessel:'', voyage:'', eta:'',
@@ -828,17 +770,78 @@ async function trackWanhaiLive(blRaw, notes) {
   upsertLocal(local);
   saveLocal();
   renderTable();
-  // Wan Hai blocks cloud/datacenter IPs, so we can't scrape it from Render.
-  // Instead we register the BL in the Google Sheet (carrier=WANHAI); the
-  // GitHub Actions Puppeteer scraper (scheduled + on-demand) fills in the
-  // live details from a non-blocked runner IP and writes them back. The
-  // dashboard then shows them on the next refresh.
   updateStats();
+  // Register the BL in the Google Sheet (carrier=WANHAI). The GitHub Actions
+  // Puppeteer scraper reads WANHAI rows on its schedule (and on demand), holds
+  // a real browser session — so it survives Wan Hai's session-expiry redirect
+  // to cargo_tracking.html — and writes the live details back to the Sheet.
+  // The dashboard then shows them via pullFromSheet().
   if (SHEETS_URL) {
     syncToSheets({ ...local });
   } else {
     toast('Enable Google Sheets sync so the Wan Hai scraper can fill this BL', 'info');
   }
+}
+
+// ============================================================
+//  PULL FROM SHEET  — the sheet is the source of truth.
+//  Merges sheet rows over local rows so scraper-filled Wan Hai data and
+//  cross-device updates appear. Local-only rows not yet in the sheet are kept.
+// ============================================================
+async function pullFromSheet() {
+  if (!SHEETS_URL) return;
+  try {
+    const res = await fetch(`${SHEETS_URL}?action=list`, { cache:'no-cache', redirect:'follow' });
+    if (!res.ok) return;
+    const rows = await res.json();
+    if (!Array.isArray(rows)) return;
+
+    // Index sheet rows by BL (upper-case).
+    const byBL = {};
+    for (const r of rows) if (r && r.blNumber) byBL[r.blNumber.toUpperCase()] = r;
+
+    // Merge: sheet value wins for any BL present in the sheet; keep local rows
+    // that haven't reached the sheet yet.
+    const merged = [];
+    const seen = {};
+    for (const r of rows) {
+      if (!r || !r.blNumber) continue;
+      const key = r.blNumber.toUpperCase();
+      if (seen[key]) continue;
+      seen[key] = true;
+      merged.push(normalizeRecord(r));
+    }
+    for (const d of DATA) {
+      const key = (d.blNumber || '').toUpperCase();
+      if (key && !seen[key]) { merged.push(d); seen[key] = true; }
+    }
+
+    DATA = merged;
+    saveLocal();
+    renderTable();
+    updateStats();
+    document.getElementById('liveStatus').textContent =
+      'Synced · ' + new Date().toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'});
+  } catch (e) { console.warn('pullFromSheet error:', e); }
+}
+
+function normalizeRecord(r) {
+  return {
+    blNumber:    r.blNumber || '',
+    searchCode:  r.searchCode || r.blNumber || '',
+    containerNo: r.containerNo || '',
+    type:        r.type || '',
+    origin:      r.origin || '',
+    destination: r.destination || '',
+    vessel:      r.vessel || '',
+    voyage:      r.voyage || '',
+    eta:         r.eta || '',
+    status:      r.status || 'Pending',
+    lastUpdated: r.lastUpdated || '',
+    notes:       r.notes || '',
+    trackUrl:    r.trackUrl || '',
+    carrier:     (r.carrier || 'ONE').toUpperCase()
+  };
 }
 
 async function trackOne(blRaw, notes) {
@@ -903,6 +906,8 @@ async function refreshAllLocal() {
   saveLocal();
   renderTable();
   updateStats();
+  // Also pull the sheet so the latest Wan Hai scraper results surface.
+  if (SHEETS_URL) await pullFromSheet();
   document.getElementById('liveStatus').textContent =
     'Synced · ' + new Date().toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'});
 }
@@ -975,14 +980,11 @@ function renderTable() {
     const carrierBadge = carrier === 'WANHAI'
       ? `<span class="badge badge-purple">Wan Hai</span>`
       : `<span class="badge badge-blue">ONE Line</span>`;
-    // Track link: ONE Line uses its own deep link; Wan Hai opens its tracking page.
+    // Track link: ONE Line uses its own deep link; Wan Hai opens its quick form.
     const trackLink = carrier === 'WANHAI'
-      ? `<a href="https://www.wanhai.com/views/cargo_track_v2/cargo_track_list.xhtml" target="_blank" class="act-btn act-btn-amber">🔗 Wan Hai</a>`
+      ? `<a href="https://www.wanhai.com/views/quick/cargo_tracking.xhtml" target="_blank" class="act-btn act-btn-amber">🔗 Wan Hai</a>`
       : `<a href="${esc(r.trackUrl)}" target="_blank" class="act-btn act-btn-amber">🔗 ONE Line</a>`;
-    // Wan Hai rows are manual, so offer an Edit button to update them.
-    const editBtn = carrier === 'WANHAI'
-      ? `<button onclick="editWanhai('${esc(r.blNumber)}')" class="act-btn act-btn-ghost">✎ Edit</button>`
-      : '';
+    const editBtn = '';
     return `<tr>
       <td>${carrierBadge}</td>
       <td><span class="bl-num">${esc(r.blNumber)}</span></td>
