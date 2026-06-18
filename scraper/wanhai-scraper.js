@@ -312,27 +312,73 @@ async function attemptForm(browser, ref) {
       try {
         const beforeUrl = target.url();
 
-        // ── ATTEMPT 0: in-session fetch of the redirect URL ────────────────
-        // formblSubmit just window.open()s tracking_data_page_by_bl_redirect.xhtml
-        // ?ref_no=..&ref_type=MFT. As a popup, its JS forward needs window.opener
-        // (broken in headless). But the endpoint is a plain GET — so fetch it from
-        // the list page's OWN context (same origin/session/cookies) with
-        // redirect:'follow'. If the server forwards (302) to the real detail page,
-        // fetch returns that HTML directly, bypassing the broken JS forward.
+        // ── ATTEMPT 0: in-session fetch, following client-side forwards ────
+        // The redirect endpoint returns a 200 HTML *shell* that forwards via JS
+        // or <meta refresh> (not a server 302), so fetch() lands on the shell.
+        // We read the shell, extract its forward target (meta refresh / location
+        // assignment / form action), and fetch THAT — looping up to 3 hops — all
+        // inside the page's own session. This is the headless-safe equivalent of
+        // letting the browser follow the forward.
         const fetched = await target.evaluate(async (refNo) => {
-          const url = '/views/cargo_track_v2/tracking_data_page_by_bl_redirect.xhtml'
-                    + '?ref_no=' + encodeURIComponent(refNo) + '&ref_type=MFT';
+          const log = [];
+          const start = '/views/cargo_track_v2/tracking_data_page_by_bl_redirect.xhtml'
+                      + '?ref_no=' + encodeURIComponent(refNo) + '&ref_type=MFT';
+          const ctnrRe = /Ctnr\s*No|Container\s*No|WHSU|Place of Receipt|Port of Discharg/i;
+          const abs = (u, base) => { try { return new URL(u, base).href; } catch { return null; } };
+
+          // Extract a forward target from shell HTML: meta-refresh, JS location
+          // assignments, window.open, or a single auto-submit form.
+          const findForward = (html, baseUrl) => {
+            let m;
+            m = html.match(/<meta[^>]*http-equiv=["']?refresh["']?[^>]*content=["'][^"']*url=([^"'>\s]+)/i);
+            if (m) return { kind:'meta', url: abs(m[1], baseUrl) };
+            m = html.match(/(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']/i)
+             || html.match(/location\.replace\(\s*["']([^"']+)["']\s*\)/i)
+             || html.match(/window\.open\(\s*["']([^"']+)["']/i);
+            if (m) return { kind:'js', url: abs(m[1], baseUrl) };
+            // Auto-submit form: take action + serialize inputs for a GET/POST.
+            const fm = html.match(/<form[^>]*action=["']([^"']+)["'][^>]*>([\s\S]*?)<\/form>/i);
+            if (fm) {
+              const action = abs(fm[1], baseUrl);
+              const method = (fm[0].match(/method=["']?(\w+)/i) || [,'get'])[1].toLowerCase();
+              const inputs = {};
+              const re = /<input[^>]*name=["']([^"']+)["'][^>]*value=["']([^"']*)["']/gi; let im;
+              while ((im = re.exec(fm[2]))) inputs[im[1]] = im[2];
+              return { kind:'form', url: action, method, inputs };
+            }
+            return null;
+          };
+
           try {
-            const r = await fetch(url, { credentials: 'include', redirect: 'follow' });
-            const html = await r.text();
-            return { ok: r.ok, status: r.status, finalUrl: r.url, len: html.length,
-                     hasCtnr: /Ctnr\s*No|Container\s*No|WHSU|Place of Receipt|Port of Discharg/i.test(html),
-                     html: html.length < 400000 ? html : html.slice(0, 400000) };
-          } catch (e) { return { ok:false, err:String(e).slice(0,100) }; }
+            let url = start, html = '', finalUrl = start, hops = 0;
+            for (hops = 0; hops < 4; hops++) {
+              const fwd0 = (hops === 0) ? null : findForward(html, finalUrl);
+              let r;
+              if (fwd0 && fwd0.kind === 'form' && fwd0.method === 'post') {
+                const body = new URLSearchParams(fwd0.inputs);
+                r = await fetch(fwd0.url, { method:'POST', credentials:'include', redirect:'follow',
+                                            headers:{'Content-Type':'application/x-www-form-urlencoded'}, body });
+              } else {
+                const next = (hops === 0) ? url : (fwd0 ? (fwd0.kind==='form'
+                              ? fwd0.url + '?' + new URLSearchParams(fwd0.inputs) : fwd0.url) : null);
+                if (!next) break;
+                r = await fetch(next, { credentials:'include', redirect:'follow' });
+              }
+              html = await r.text();
+              finalUrl = r.url || finalUrl;
+              log.push(`hop${hops}:${(finalUrl.split('/').pop()||'').slice(0,40)} len=${html.length} ctnr=${ctnrRe.test(html)}`);
+              if (ctnrRe.test(html)) break;
+              if (hops > 0 && !findForward(html, finalUrl)) break;
+            }
+            return { ok:true, finalUrl, len:html.length, hasCtnr:ctnrRe.test(html), log,
+                     shellHead: html.slice(0, 600).replace(/\s+/g,' '),
+                     html: html.length < 400000 ? html : html.slice(0,400000) };
+          } catch (e) { return { ok:false, err:String(e).slice(0,120), log }; }
         }, ref).catch(e => ({ ok:false, err:e.message }));
-        console.log(`[WHL]   detail FETCH0: ok=${fetched.ok} status=${fetched.status||''} ` +
-                    `len=${fetched.len||0} hasCtnr=${fetched.hasCtnr} final=${(fetched.finalUrl||'').split('/').pop()} ` +
-                    `err="${fetched.err||''}"`);
+        console.log(`[WHL]   detail FETCH0: ok=${fetched.ok} hasCtnr=${fetched.hasCtnr} ` +
+                    `final=${(fetched.finalUrl||'').split('/').pop()} hops=${JSON.stringify(fetched.log||[])} err="${fetched.err||''}"`);
+        if (fetched.shellHead && !fetched.hasCtnr)
+          console.log(`[WHL]   detail SHELLHEAD: ${fetched.shellHead}`);
 
         if (fetched.ok && fetched.hasCtnr && fetched.html) {
           // Parse the fetched detail HTML in a throwaway DOM via the page.
