@@ -268,6 +268,38 @@ async function attemptForm(browser, ref) {
     const rec = parseFromTables(tables, ref);
     rec.sourceUrl = target.url();
 
+    // ── LIST-PAGE PROBE (temporary): the detail page needs a JSF POST we can't
+    // reproduce by GET, so before drilling, inspect what the LIST page itself
+    // already holds — it often contains a hidden/expandable container section,
+    // and the postback may also populate THIS page in place. Dump structure +
+    // every label:value-ish pair + the BL row's anchors (id/onclick) so we can
+    // target the right control or read data that's already present.
+    const listProbe = await target.evaluate((refNo) => {
+      const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+      const out = { url: location.href, tables: 0, forms: [], anchors: [], ctnrCtx: [], allTextLen: 0 };
+      out.tables = document.querySelectorAll('table').length;
+      out.allTextLen = clean(document.body.innerText).length;
+      // Forms + their key hidden inputs (ViewState etc.) — confirms the POST shape.
+      for (const f of document.querySelectorAll('form')) {
+        out.forms.push({
+          id: f.id, action: (f.getAttribute('action') || '').slice(0, 80),
+          inputs: [...f.querySelectorAll('input')].slice(0, 12)
+            .map(i => `${i.name || i.id}=${(i.value || '').slice(0, 20)}`)
+        });
+      }
+      // Every anchor's id + onclick (to find the real container/detail trigger).
+      out.anchors = [...document.querySelectorAll('a')].slice(0, 12).map(a =>
+        `id=${a.id || '-'} txt="${clean(a.innerText).slice(0, 24)}" oc="${(a.getAttribute('onclick') || '').slice(0, 70)}"`);
+      // Context around container-ish keywords anywhere in the DOM text.
+      const body = document.body.innerText || '';
+      for (const kw of ['Ctnr', 'Container', 'WHSU', 'Estimated', 'Arrival', 'Discharge', 'Receipt', 'Laden', 'Gate']) {
+        const i = body.indexOf(kw);
+        if (i >= 0) out.ctnrCtx.push(kw + ':«' + clean(body.slice(i, i + 70)) + '»');
+      }
+      return out;
+    }, ref).catch(e => ({ probeErr: e.message }));
+    console.log('[WHL]   LISTPROBE: ' + JSON.stringify(listProbe).slice(0, 1400));
+
     // ── DETAIL DRILL-DOWN ──────────────────────────────────────────────
     // The list view (tracking_data_list.xhtml) only carries BL / Onboard /
     // Voyage / Vessel + a "More detail" link. Container No., type, ports and
