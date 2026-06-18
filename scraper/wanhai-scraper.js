@@ -316,46 +316,71 @@ async function attemptForm(browser, ref) {
           (document.body.innerText || '').replace(/\s+/g, ' ').length);
 
         const clickInfo = await target.evaluate((refNo) => {
-          const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toUpperCase();
-          const info = { anchors: 0, strategy: '', onclickAttr: '', clicked: false,
-                         targetedForm: false };
+          const info = { anchors: 0, strategy: '', clicked: false, targetedForm: false,
+                         fnSrc: '', hiddenBefore: [], submitted: false };
           const allA = [...document.querySelectorAll('a')];
           info.anchors = allA.length;
 
-          // KEY FIX (from LISTPROBE): the result is a JSF POST against the
-          // cargoTrackV2Bean form. jsfcljs submits it to a NEW window by default,
-          // and that window gets a redirect shell that dies without the POST body.
-          // Force the form to render IN THIS PAGE by setting target='_self' —
-          // the same trick the original search-form flow uses. Then the POST
-          // result (the detail page) replaces THIS document, ViewState intact.
           const form = document.getElementById('cargoTrackV2Bean') || document.querySelector('form');
           if (form) { form.setAttribute('target', '_self'); form.target = '_self'; info.targetedForm = true; }
 
-          // Per the user's tracking procedure, prefer the "B/L Data" link
-          // (formblSubmit(..,'MFT')); fall back to "Booking Data"
-          // (formbookingSubmit(..,'BKG')). Both POST the same form.
-          const pick = (re) => allA.find(a => re.test(a.getAttribute('onclick') || '') || re.test(a.innerText || ''));
-          let link = pick(/formblSubmit\s*\(|B\/?L\s*Data/i);
-          if (link) info.strategy = 'blData';
-          if (!link) { link = pick(/formbookingSubmit\s*\(|Booking\s*Data/i); if (link) info.strategy = 'bookingData'; }
+          // Capture formblSubmit's source so we can see which hidden fields it
+          // sets (the LISTPROBE proved this is a JSF form POST, not a GET).
+          if (typeof window.formblSubmit === 'function') {
+            info.fnSrc = String(window.formblSubmit).replace(/\s+/g, ' ').slice(0, 400);
+          }
+          // Snapshot hidden inputs before, to compare what the fn changes.
+          if (form) {
+            info.hiddenBefore = [...form.querySelectorAll('input[type=hidden],input:not([type])')]
+              .map(i => `${i.name || i.id}=${(i.value || '').slice(0, 24)}`).slice(0, 20);
+          }
 
-          if (link) {
-            info.onclickAttr = (link.getAttribute('onclick') || '').slice(0, 140);
-            link.removeAttribute('target');
-            // Dispatch a trusted-style bubbling click so jsf.util.chain's event
-            // arg is real and mojarra runs the form POST (now target=_self).
-            link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-            info.clicked = true;
+          // STRATEGY: call formblSubmit directly (it sets the hidden fields),
+          // THEN submit the form natively. Native submit() always navigates and
+          // doesn't depend on a trusted event — unlike the dispatched click,
+          // which fired jsf.util.chain but mojarra's programmatic submit didn't
+          // navigate. We let formblSubmit populate the params, then force the POST.
+          try {
+            if (typeof window.formblSubmit === 'function') {
+              info.strategy = 'fnThenSubmit';
+              // formblSubmit may itself submit; if it doesn't navigate we follow up.
+              window.formblSubmit(refNo, 'MFT');
+              info.clicked = true;
+            }
+          } catch (e) { info.fnErr = String(e).slice(0, 80); }
+
+          // If the fn didn't exist, fall back to clicking the B/L Data anchor.
+          if (!info.clicked) {
+            const link = allA.find(a => /formblSubmit\s*\(|B\/?L\s*Data/i.test((a.getAttribute('onclick')||'') + ' ' + (a.innerText||'')));
+            if (link) {
+              info.strategy = 'blDataClick';
+              link.removeAttribute('target');
+              link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+              info.clicked = true;
+            }
           }
           return info;
         }, ref);
 
-        console.log(`[WHL]   detail: anchors=${clickInfo.anchors} strategy=${clickInfo.strategy} ` +
-                    `targetedForm=${clickInfo.targetedForm} clicked=${clickInfo.clicked} ` +
-                    `onclick="${clickInfo.onclickAttr}"`);
+        console.log(`[WHL]   detail: strategy=${clickInfo.strategy} targetedForm=${clickInfo.targetedForm} ` +
+                    `clicked=${clickInfo.clicked} fnErr="${clickInfo.fnErr||''}"`);
+        console.log(`[WHL]   detail: fnSrc="${clickInfo.fnSrc}"`);
+        console.log(`[WHL]   detail: hiddenBefore=${JSON.stringify(clickInfo.hiddenBefore).slice(0,400)}`);
 
-        // With target=_self the POST navigates THIS page. Wait for that navigation.
-        await target.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => {});
+        // Wait for the POST navigation. If formblSubmit set fields but didn't
+        // submit, force a native submit now and wait again.
+        let nav = await target.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => null);
+        if (!nav) {
+          const forced = await target.evaluate(() => {
+            const f = document.getElementById('cargoTrackV2Bean') || document.querySelector('form');
+            if (f) { f.target = '_self'; (f.requestSubmit ? f.requestSubmit() : f.submit()); return true; }
+            return false;
+          }).catch(() => false);
+          console.log(`[WHL]   detail: forcedNativeSubmit=${forced}`);
+          if (forced) {
+            await target.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+          }
+        }
 
         if (clickInfo.clicked) {
           // The jsfcljs postback may either (a) swap content in place at the
