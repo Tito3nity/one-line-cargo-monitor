@@ -312,7 +312,88 @@ async function attemptForm(browser, ref) {
       try {
         const beforeUrl = target.url();
 
-        // formblSubmit(ref,'MFT') does ONE thing (confirmed from its source):
+        // ── ATTEMPT 0: in-session fetch of the redirect URL ────────────────
+        // formblSubmit just window.open()s tracking_data_page_by_bl_redirect.xhtml
+        // ?ref_no=..&ref_type=MFT. As a popup, its JS forward needs window.opener
+        // (broken in headless). But the endpoint is a plain GET — so fetch it from
+        // the list page's OWN context (same origin/session/cookies) with
+        // redirect:'follow'. If the server forwards (302) to the real detail page,
+        // fetch returns that HTML directly, bypassing the broken JS forward.
+        const fetched = await target.evaluate(async (refNo) => {
+          const url = '/views/cargo_track_v2/tracking_data_page_by_bl_redirect.xhtml'
+                    + '?ref_no=' + encodeURIComponent(refNo) + '&ref_type=MFT';
+          try {
+            const r = await fetch(url, { credentials: 'include', redirect: 'follow' });
+            const html = await r.text();
+            return { ok: r.ok, status: r.status, finalUrl: r.url, len: html.length,
+                     hasCtnr: /Ctnr\s*No|Container\s*No|WHSU|Place of Receipt|Port of Discharg/i.test(html),
+                     html: html.length < 400000 ? html : html.slice(0, 400000) };
+          } catch (e) { return { ok:false, err:String(e).slice(0,100) }; }
+        }, ref).catch(e => ({ ok:false, err:e.message }));
+        console.log(`[WHL]   detail FETCH0: ok=${fetched.ok} status=${fetched.status||''} ` +
+                    `len=${fetched.len||0} hasCtnr=${fetched.hasCtnr} final=${(fetched.finalUrl||'').split('/').pop()} ` +
+                    `err="${fetched.err||''}"`);
+
+        if (fetched.ok && fetched.hasCtnr && fetched.html) {
+          // Parse the fetched detail HTML in a throwaway DOM via the page.
+          const detail = await target.evaluate((html, refNo) => {
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            const rowsByTable = [];
+            for (const tbl of doc.querySelectorAll('table')) {
+              const rows = [...tbl.querySelectorAll('tr')].map(tr =>
+                [...tr.querySelectorAll('td,th')].map(td => clean(td.textContent)));
+              if (rows.some(r => r.some(c => c.length))) rowsByTable.push(rows);
+            }
+            const flat = []; for (const rs of rowsByTable) for (const r of rs) flat.push(r);
+            const out = { containerNo:'', type:'', origin:'', destination:'', eta:'', etd:'', status:'' };
+            // Container block: header with Ctnr No + Current Status, then rows.
+            let inCtnr = false; const ctnrs = [];
+            for (const row of flat) {
+              const j = row.join(' ').toLowerCase();
+              if (j.includes('ctnr no') && j.includes('current status')) { inCtnr = true; continue; }
+              if (inCtnr && /^[A-Z]{4}\d{6,7}$/.test((row[1]||'').trim()))
+                ctnrs.push({ no: row[1].trim(), tp: (row[2]||'').trim(), st: (row[7]||row[row.length-2]||'').trim() });
+            }
+            if (ctnrs.length) {
+              out.containerNo = ctnrs.map(c=>c.no).join(', ');
+              out.type = ctnrs.map(c=>c.tp).filter(Boolean).join(', ');
+              out.status = ctnrs[0].st || '';
+            }
+            // Ports / dates.
+            for (const row of flat) {
+              const head=(row[0]||'').toLowerCase(), loc=(row[1]||'').trim(), date=(row[row.length-1]||'').trim();
+              if (head.startsWith('place of receipt')||head.startsWith('port of loading')) {
+                if (!out.origin && loc && loc!=='---') out.origin=loc;
+                if (/depart/i.test(row.join(' ')) && date) out.etd=date;
+              } else if (head.startsWith('port of discharg')||head.startsWith('place of delivery')) {
+                if (loc && loc!=='---') out.destination=loc;
+                if (/arriv/i.test(row.join(' ')) && date) out.eta=date;
+              }
+            }
+            return out;
+          }, fetched.html, ref).catch(e => ({ _err: e.message }));
+
+          console.log(`[WHL]   detail FETCH0 parsed: ctnr="${detail.containerNo||''}" type="${detail.type||''}" ` +
+                      `dest="${detail.destination||''}" eta="${detail.eta||''}"`);
+          if (detail && (detail.containerNo || detail.eta || detail.destination)) {
+            rec.containerNo = rec.containerNo || detail.containerNo;
+            rec.type        = rec.type        || detail.type;
+            rec.origin      = rec.origin      || detail.origin;
+            rec.destination = rec.destination || detail.destination;
+            rec.eta         = rec.eta         || detail.eta;
+            rec.etd         = rec.etd         || detail.etd;
+            if (detail.status && /transit|discharg|arriv|deliver|load|gate|empty|full/i.test(detail.status))
+              rec.status = detail.status;
+            rec.detailDiag = `det:fetch0/ctnr:${detail.containerNo?'y':'n'}/eta:${detail.eta?'y':'n'}`;
+          }
+        }
+
+        // If fetch0 already populated the detail, skip the popup dance entirely.
+        const stillNeed = !rec.containerNo && !rec.eta && !rec.destination;
+        if (!stillNeed) {
+          console.log('[WHL]   detail: fetch0 satisfied — skipping popup');
+        } else {
         //   window.open('/views/cargo_track_v2/tracking_data_page_by_bl_redirect.xhtml?ref_no=..&ref_type=MFT','_blank')
         // i.e. it opens the BL detail in a popup. We register a popup listener,
         // call the fn, then wait on that popup for the redirect shell to forward
@@ -427,6 +508,7 @@ async function attemptForm(browser, ref) {
             rec.detailDiag = 'det:errorpage';
           }
         }
+        } // end stillNeed (popup fallback) block
       } catch (e) {
         rec.detailErr = e.message;
         rec.detailDiag = 'det:exc:' + (e.message || '').slice(0, 40);
