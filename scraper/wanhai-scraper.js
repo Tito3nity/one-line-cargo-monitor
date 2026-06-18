@@ -189,6 +189,7 @@ async function attemptForm(browser, ref) {
   page.setDefaultNavigationTimeout(NAV_TIMEOUT);
   await page.setUserAgent(UA);
   let popup = null;
+  let popup2 = null;   // detail-page popup opened by the formbookingSubmit postback
   try {
     await page.goto(FORM_PAGE, { waitUntil: 'domcontentloaded' });
 
@@ -363,26 +364,45 @@ async function attemptForm(browser, ref) {
             )
             .catch(() => {});
 
-          // Check for a popup result tab opened by the postback.
-          let popup2 = null;
+          // Check for a popup result tab opened by the postback. Match the
+          // booking/BL detail pages AND their _redirect.xhtml shells (the
+          // postback opens tracking_data_page_by_booking_redirect.xhtml, which
+          // then forwards to the real detail page). VERIFIED FROM LIVE LOG.
           for (const p of await browser.pages()) {
             if (pagesBefore.has(p)) continue;
             const u = p.url();
-            if (/tracking_data_page_by_bl\.xhtml|tracking_data_list\.xhtml|cargo_track/i.test(u)) {
+            if (/tracking_data_page_by_(bl|booking)(_redirect)?\.xhtml|tracking_data_list\.xhtml|cargo_track/i.test(u)) {
               popup2 = p; break;
             }
           }
           if (popup2) {
             console.log(`[WHL]   detail: popup opened -> ${popup2.url().split('/').pop()}`);
             await popup2.bringToFront().catch(() => {});
+
+            // The *_redirect.xhtml page is a shell that forwards (meta-refresh /
+            // JS / server redirect) to the real detail page. Wait for the URL to
+            // leave the redirect shell first...
             await popup2.waitForFunction(
-              () => /ctnr no|place of receipt|port of discharg|estimated|laden|container no/i.test(document.body.innerText),
-              { timeout: 15000, polling: 500 }
+              () => !/_redirect\.xhtml/i.test(location.href),
+              { timeout: 20000, polling: 400 }
             ).catch(() => {});
+            // ...then wait for the detail document to actually render its tables.
+            await popup2.waitForFunction(
+              () => {
+                const t = document.body ? document.body.innerText : '';
+                return document.querySelectorAll('table').length > 0 &&
+                       /ctnr no|place of receipt|port of discharg|estimated|laden|container|vessel/i.test(t);
+              },
+              { timeout: 25000, polling: 500 }
+            ).catch(() => {});
+            // Extra settle for any late ajax population.
+            await new Promise(r => setTimeout(r, 2000));
+            console.log(`[WHL]   detail: popup settled -> ${popup2.url().split('/').pop()}`);
             target = popup2;   // parse the popup from here on
+          } else {
+            // No popup: give an in-place ajax repaint a moment to settle.
+            await new Promise(r => setTimeout(r, 1500));
           }
-          // Give a JSF ajax repaint a moment to settle.
-          await new Promise(r => setTimeout(r, 1500));
 
           const afterUrl = target.url();
           console.log(`[WHL]   detail: ${beforeUrl.split('/').pop()} -> ${afterUrl.split('/').pop()} ` +
@@ -441,6 +461,7 @@ async function attemptForm(browser, ref) {
 
     return rec;
   } finally {
+    if (popup2) await popup2.close().catch(() => {});
     if (popup) await popup.close().catch(() => {});
     await page.close().catch(() => {});
   }
