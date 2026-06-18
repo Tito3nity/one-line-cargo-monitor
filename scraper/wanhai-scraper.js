@@ -317,66 +317,45 @@ async function attemptForm(browser, ref) {
 
         const clickInfo = await target.evaluate((refNo) => {
           const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toUpperCase();
-          const info = { anchors: 0, strategy: '', href: '', onclickAttr: '',
-                         clicked: false, fnExists: false, fnArgs: '' };
+          const info = { anchors: 0, strategy: '', onclickAttr: '', clicked: false,
+                         targetedForm: false };
           const allA = [...document.querySelectorAll('a')];
           info.anchors = allA.length;
 
-          const link = allA.find(a => /formbookingSubmit\s*\(/i.test(a.getAttribute('onclick') || ''));
+          // KEY FIX (from LISTPROBE): the result is a JSF POST against the
+          // cargoTrackV2Bean form. jsfcljs submits it to a NEW window by default,
+          // and that window gets a redirect shell that dies without the POST body.
+          // Force the form to render IN THIS PAGE by setting target='_self' —
+          // the same trick the original search-form flow uses. Then the POST
+          // result (the detail page) replaces THIS document, ViewState intact.
+          const form = document.getElementById('cargoTrackV2Bean') || document.querySelector('form');
+          if (form) { form.setAttribute('target', '_self'); form.target = '_self'; info.targetedForm = true; }
+
+          // Per the user's tracking procedure, prefer the "B/L Data" link
+          // (formblSubmit(..,'MFT')); fall back to "Booking Data"
+          // (formbookingSubmit(..,'BKG')). Both POST the same form.
+          const pick = (re) => allA.find(a => re.test(a.getAttribute('onclick') || '') || re.test(a.innerText || ''));
+          let link = pick(/formblSubmit\s*\(|B\/?L\s*Data/i);
+          if (link) info.strategy = 'blData';
+          if (!link) { link = pick(/formbookingSubmit\s*\(|Booking\s*Data/i); if (link) info.strategy = 'bookingData'; }
+
           if (link) {
-            info.strategy = 'formbookingSubmit';
-            info.href = link.getAttribute('href') || '';
-            const oc = link.getAttribute('onclick') || '';
-            info.onclickAttr = oc.slice(0, 140);
-
-            // STRATEGY 1 — call the JSF function directly with the exact args
-            // parsed from the onclick. The live log shows: formbookingSubmit('025G657555', 'BKG').
-            // Calling it in page context runs mojarra's real form submit without
-            // depending on a trusted click event (which headless .click() lacks).
-            const m = oc.match(/formbookingSubmit\(\s*'([^']*)'\s*,\s*'([^']*)'\s*\)/i);
-            info.fnArgs = m ? (m[1] + ',' + m[2]) : '';
-            if (typeof window.formbookingSubmit === 'function' && m) {
-              info.fnExists = true;
-              try { window.formbookingSubmit(m[1], m[2]); info.clicked = true; info.strategy += '+fn'; }
-              catch (e) { info.fnErr = String(e).slice(0, 80); }
-            }
-
-            // STRATEGY 2 — if the function isn't global or threw, run the onclick
-            // chain itself (it contains jsf.util.chain + mojarra.jsfcljs).
-            if (!info.clicked) {
-              try {
-                link.removeAttribute('target');
-                // Dispatch a bubbling MouseEvent so jsf.util.chain's `event` arg is real.
-                link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                info.clicked = true; info.strategy += '+evt';
-              } catch (e) { info.evtErr = String(e).slice(0, 80); }
-            }
-          } else {
-            // FALLBACK: explicit "More detail" text, then row anchor.
-            let l2 = allA.find(a => /more\s*detail/i.test(a.innerText));
-            if (l2) info.strategy = 'moreDetailText';
-            if (!l2) {
-              for (const tr of document.querySelectorAll('tr')) {
-                if (norm(tr.innerText).includes(refNo.toUpperCase())) {
-                  const a = tr.querySelector('a');
-                  if (a) { l2 = a; info.strategy = 'rowAnchor'; break; }
-                }
-              }
-            }
-            if (l2) {
-              info.href = l2.getAttribute('href') || '';
-              info.onclickAttr = (l2.getAttribute('onclick') || '').slice(0, 140);
-              l2.removeAttribute('target');
-              l2.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-              info.clicked = true;
-            }
+            info.onclickAttr = (link.getAttribute('onclick') || '').slice(0, 140);
+            link.removeAttribute('target');
+            // Dispatch a trusted-style bubbling click so jsf.util.chain's event
+            // arg is real and mojarra runs the form POST (now target=_self).
+            link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            info.clicked = true;
           }
           return info;
         }, ref);
 
         console.log(`[WHL]   detail: anchors=${clickInfo.anchors} strategy=${clickInfo.strategy} ` +
-                    `clicked=${clickInfo.clicked} fnExists=${clickInfo.fnExists} fnArgs="${clickInfo.fnArgs}" ` +
-                    `fnErr="${clickInfo.fnErr||''}" onclick="${clickInfo.onclickAttr}"`);
+                    `targetedForm=${clickInfo.targetedForm} clicked=${clickInfo.clicked} ` +
+                    `onclick="${clickInfo.onclickAttr}"`);
+
+        // With target=_self the POST navigates THIS page. Wait for that navigation.
+        await target.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => {});
 
         if (clickInfo.clicked) {
           // The jsfcljs postback may either (a) swap content in place at the
