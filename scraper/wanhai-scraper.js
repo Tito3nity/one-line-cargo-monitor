@@ -284,51 +284,72 @@ async function attemptForm(browser, ref) {
 
         const clickInfo = await target.evaluate((refNo) => {
           const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toUpperCase();
-          const info = { anchors: 0, strategy: '', href: '', onclickAttr: '', clicked: false };
+          const info = { anchors: 0, strategy: '', href: '', onclickAttr: '',
+                         clicked: false, fnExists: false, fnArgs: '' };
           const allA = [...document.querySelectorAll('a')];
           info.anchors = allA.length;
 
-          // PRIMARY: the detail trigger is a JSF anchor whose onclick calls
-          // formbookingSubmit('<BL>', 'BKG'|'MFT'). VERIFIED FROM LIVE LOG.
-          // Click THAT element directly so the JSF/mojarra handler fires its
-          // ajax postback (it updates the page in place — same URL).
-          let link = allA.find(a => /formbookingSubmit\s*\(/i.test(a.getAttribute('onclick') || ''));
-          if (link) info.strategy = 'formbookingSubmit';
+          const link = allA.find(a => /formbookingSubmit\s*\(/i.test(a.getAttribute('onclick') || ''));
+          if (link) {
+            info.strategy = 'formbookingSubmit';
+            info.href = link.getAttribute('href') || '';
+            const oc = link.getAttribute('onclick') || '';
+            info.onclickAttr = oc.slice(0, 140);
 
-          // FALLBACK 1: explicit "More detail" text.
-          if (!link) {
-            link = allA.find(a => /more\s*detail/i.test(a.innerText));
-            if (link) info.strategy = 'moreDetailText';
-          }
-          // FALLBACK 2: first anchor in the BL's row (last resort).
-          if (!link) {
-            for (const tr of document.querySelectorAll('tr')) {
-              if (norm(tr.innerText).includes(refNo.toUpperCase())) {
-                const a = tr.querySelector('a');
-                if (a) { link = a; info.strategy = 'rowAnchor'; break; }
+            // STRATEGY 1 — call the JSF function directly with the exact args
+            // parsed from the onclick. The live log shows: formbookingSubmit('025G657555', 'BKG').
+            // Calling it in page context runs mojarra's real form submit without
+            // depending on a trusted click event (which headless .click() lacks).
+            const m = oc.match(/formbookingSubmit\(\s*'([^']*)'\s*,\s*'([^']*)'\s*\)/i);
+            info.fnArgs = m ? (m[1] + ',' + m[2]) : '';
+            if (typeof window.formbookingSubmit === 'function' && m) {
+              info.fnExists = true;
+              try { window.formbookingSubmit(m[1], m[2]); info.clicked = true; info.strategy += '+fn'; }
+              catch (e) { info.fnErr = String(e).slice(0, 80); }
+            }
+
+            // STRATEGY 2 — if the function isn't global or threw, run the onclick
+            // chain itself (it contains jsf.util.chain + mojarra.jsfcljs).
+            if (!info.clicked) {
+              try {
+                link.removeAttribute('target');
+                // Dispatch a bubbling MouseEvent so jsf.util.chain's `event` arg is real.
+                link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                info.clicked = true; info.strategy += '+evt';
+              } catch (e) { info.evtErr = String(e).slice(0, 80); }
+            }
+          } else {
+            // FALLBACK: explicit "More detail" text, then row anchor.
+            let l2 = allA.find(a => /more\s*detail/i.test(a.innerText));
+            if (l2) info.strategy = 'moreDetailText';
+            if (!l2) {
+              for (const tr of document.querySelectorAll('tr')) {
+                if (norm(tr.innerText).includes(refNo.toUpperCase())) {
+                  const a = tr.querySelector('a');
+                  if (a) { l2 = a; info.strategy = 'rowAnchor'; break; }
+                }
               }
             }
-          }
-
-          if (link) {
-            info.href = link.getAttribute('href') || '';
-            info.onclickAttr = (link.getAttribute('onclick') || '').slice(0, 140);
-            link.removeAttribute('target');
-            // Fire the native click so JSF's registered handler runs (calling
-            // .onclick() directly can skip mojarra's event chain).
-            link.click();
-            info.clicked = true;
+            if (l2) {
+              info.href = l2.getAttribute('href') || '';
+              info.onclickAttr = (l2.getAttribute('onclick') || '').slice(0, 140);
+              l2.removeAttribute('target');
+              l2.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+              info.clicked = true;
+            }
           }
           return info;
         }, ref);
 
         console.log(`[WHL]   detail: anchors=${clickInfo.anchors} strategy=${clickInfo.strategy} ` +
-                    `clicked=${clickInfo.clicked} href="${clickInfo.href}" onclick="${clickInfo.onclickAttr}"`);
+                    `clicked=${clickInfo.clicked} fnExists=${clickInfo.fnExists} fnArgs="${clickInfo.fnArgs}" ` +
+                    `fnErr="${clickInfo.fnErr||''}" onclick="${clickInfo.onclickAttr}"`);
 
         if (clickInfo.clicked) {
-          // This is a JSF ajax postback: the URL stays the same and the DOM is
-          // swapped in place. So DON'T wait for navigation — wait for the
-          // container/ETA content to APPEAR (or the body text to change size).
+          // The jsfcljs postback may either (a) swap content in place at the
+          // same URL, or (b) open the detail in a NEW popup tab. Handle both.
+          const pagesBefore = new Set(await browser.pages());
+          // Wait for in-place content change OR a popup to appear.
           await target
             .waitForFunction(
               (prevLen) => {
@@ -337,10 +358,29 @@ async function attemptForm(browser, ref) {
                 const changed = Math.abs(t.replace(/\s+/g, ' ').length - prevLen) > 40;
                 return hasDetail || changed;
               },
-              { timeout: 25000, polling: 500 },
+              { timeout: 12000, polling: 500 },
               beforeFp
             )
             .catch(() => {});
+
+          // Check for a popup result tab opened by the postback.
+          let popup2 = null;
+          for (const p of await browser.pages()) {
+            if (pagesBefore.has(p)) continue;
+            const u = p.url();
+            if (/tracking_data_page_by_bl\.xhtml|tracking_data_list\.xhtml|cargo_track/i.test(u)) {
+              popup2 = p; break;
+            }
+          }
+          if (popup2) {
+            console.log(`[WHL]   detail: popup opened -> ${popup2.url().split('/').pop()}`);
+            await popup2.bringToFront().catch(() => {});
+            await popup2.waitForFunction(
+              () => /ctnr no|place of receipt|port of discharg|estimated|laden|container no/i.test(document.body.innerText),
+              { timeout: 15000, polling: 500 }
+            ).catch(() => {});
+            target = popup2;   // parse the popup from here on
+          }
           // Give a JSF ajax repaint a moment to settle.
           await new Promise(r => setTimeout(r, 1500));
 
