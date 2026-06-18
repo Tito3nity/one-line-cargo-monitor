@@ -268,9 +268,83 @@ async function attemptForm(browser, ref) {
     const rec = parseFromTables(tables, ref);
     rec.sourceUrl = target.url();
 
-    // Detail fields (container/ETA/ports) come from the SeaRates API in
-    // scrapeWanHai(); this scraper fallback returns list-view vessel/voyage/
-    // status only. The detail page is unreachable headless (JS redirect shell).
+    // ── IN-FRAME DETAIL POSTBACK ───────────────────────────────────────────
+    // The LIST page contains the JSF command links (autoLink_ / "B/L Data" =
+    // formblSubmit) that load the detail page. Clicking them opens a popup whose
+    // redirect shell we can't render headless. Instead, replay the postback IN
+    // THIS FRAME: force the cargoTrackV2Bean form to target=_self so the JSF
+    // POST navigates the list page itself to the detail result (ViewState +
+    // session intact, no popup, no cold GET). Then parse the detail in-place.
+    if (!rec.containerNo || !rec.eta || !rec.destination) {
+      try {
+        // Probe what command links exist on the list page (id + onclick), so we
+        // target the right one and can see the JSF call shape.
+        const probe = await target.evaluate(() => {
+          const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+          const links = [...document.querySelectorAll('a')].map(a => ({
+            id: a.id || '', txt: clean(a.textContent).slice(0, 20),
+            oc: (a.getAttribute('onclick') || '').slice(0, 160),
+          })).filter(l => /autoLink_|formblSubmit|formbookingSubmit|B\/?L\s*Data|Booking\s*Data/i.test(l.id + l.txt + l.oc));
+          const form = document.getElementById('cargoTrackV2Bean') || document.querySelector('form');
+          return { links: links.slice(0, 8), hasForm: !!form,
+                   formAction: form ? (form.getAttribute('action') || '') : '' };
+        }).catch(e => ({ err: e.message }));
+        console.log('[WHL]   DETAILLINKS: ' + JSON.stringify(probe).slice(0, 800));
+
+        // Fire the B/L Data postback in-frame. Force target=_self FIRST, then
+        // run the link's own onclick (jsf.util.chain + mojarra.jsfcljs) so JSF
+        // submits cargoTrackV2Bean to this same frame.
+        const fired = await target.evaluate(() => {
+          const form = document.getElementById('cargoTrackV2Bean') || document.querySelector('form');
+          if (form) { form.setAttribute('target', '_self'); form.target = '_self'; }
+          // Prefer the B/L Data link; fall back to an autoLink_ or Booking Data.
+          const pick = re => [...document.querySelectorAll('a')]
+            .find(a => re.test((a.getAttribute('onclick') || '') + ' ' + (a.textContent || '') + ' ' + (a.id || '')));
+          const a = pick(/formblSubmit|B\/?L\s*Data/i) || pick(/autoLink_/i) || pick(/formbookingSubmit|Booking\s*Data/i);
+          if (!a) return { ok: false, reason: 'no detail link on list page' };
+          a.removeAttribute('target');
+          // Run the onclick code directly (it contains the mojarra submit), then
+          // also dispatch a native click as a belt-and-braces trigger.
+          const oc = a.getAttribute('onclick');
+          try { if (oc) { new Function('event', oc).call(a, new MouseEvent('click', { bubbles: true })); } } catch (e) {}
+          a.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+          return { ok: true, used: a.id || a.textContent.trim().slice(0, 20) };
+        }).catch(e => ({ ok: false, reason: e.message }));
+        console.log('[WHL]   DETAILFIRE: ' + JSON.stringify(fired).slice(0, 300));
+
+        if (fired.ok) {
+          // Wait for the in-frame navigation OR in-place content swap to detail.
+          await target.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {});
+          await target.waitForFunction(
+            () => /ctnr no|place of receipt|port of discharg|estimated|laden|container no/i
+                    .test(document.body?.innerText || ''),
+            { timeout: 20000, polling: 500 }
+          ).catch(() => {});
+          await new Promise(r => setTimeout(r, 2000));
+
+          const durl = target.url();
+          const dtables = await target.evaluate(() => document.querySelectorAll('table').length).catch(() => 0);
+          console.log(`[WHL]   DETAIL after fire: url=${durl.split('/').pop()} tables=${dtables}`);
+
+          if (!ERROR_PAGE_RE.test(durl)) {
+            const detailTables = await readTables(target);
+            const detail = parseFromTables(detailTables, ref);
+            console.log(`[WHL]   DETAIL parsed: ctnr="${detail.containerNo}" type="${detail.type}" ` +
+                        `dest="${detail.destination}" eta="${detail.eta}"`);
+            rec.containerNo = rec.containerNo || detail.containerNo;
+            rec.type        = rec.type        || detail.type;
+            rec.origin      = rec.origin      || detail.origin;
+            rec.destination = rec.destination || detail.destination;
+            rec.eta         = rec.eta         || detail.eta;
+            rec.etd         = rec.etd         || detail.etd;
+            if (detail.status && /transit|discharg|arriv|deliver|load|gate|empty|full/i.test(detail.status))
+              rec.status = detail.status;
+          }
+        }
+      } catch (e) {
+        console.log(`[WHL]   DETAIL postback EXC: ${e.message}`);
+      }
+    }
 
     return rec;
   } finally {
