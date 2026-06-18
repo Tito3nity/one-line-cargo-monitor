@@ -323,6 +323,30 @@ async function attemptForm(browser, ref) {
                       `errorPage=${ERROR_PAGE_RE.test(afterUrl)}`);
 
           if (!ERROR_PAGE_RE.test(afterUrl)) {
+            // ── STRUCTURAL PROBE (temporary): log how the detail page is really
+            // laid out, so we stop guessing. Logs table count, key element
+            // counts, any "container"-ish text context, and a labelled-value
+            // sample. Safe to remove once the parser is confirmed.
+            const probe = await target.evaluate(() => {
+              const out = { tables: 0, divs: 0, uls: 0, dls: 0, ctnrCtx: [], labels: [] };
+              out.tables = document.querySelectorAll('table').length;
+              out.divs   = document.querySelectorAll('div').length;
+              out.uls    = document.querySelectorAll('ul').length;
+              out.dls    = document.querySelectorAll('dl').length;
+              const body = document.body.innerText || '';
+              // Capture ~80 chars around each occurrence of container-ish words.
+              for (const kw of ['Ctnr', 'Container', 'Estimated', 'Arrival', 'Discharge', 'Receipt']) {
+                const i = body.indexOf(kw);
+                if (i >= 0) out.ctnrCtx.push(kw + ':«' + body.slice(i, i + 80).replace(/\s+/g, ' ') + '»');
+              }
+              // Any element whose className/id hints at the container panel.
+              const hint = [...document.querySelectorAll('[id*="ctnr"],[id*="container"],[class*="ctnr"],[class*="container"]')]
+                .slice(0, 5).map(e => (e.tagName + '#' + (e.id || '') + '.' + (e.className || '')).slice(0, 60));
+              out.hintEls = hint;
+              return out;
+            }).catch(e => ({ probeErr: e.message }));
+            console.log('[WHL]   PROBE: ' + JSON.stringify(probe).slice(0, 900));
+
             const detailTables = await readTables(target);
             const detail = parseFromTables(detailTables, ref);
             console.log(`[WHL]   detail parsed: ctnr="${detail.containerNo}" type="${detail.type}" ` +
