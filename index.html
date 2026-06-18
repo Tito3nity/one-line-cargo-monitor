@@ -601,6 +601,7 @@ tbody td {
     <div class="card-head">
       <h2>📋 Active Shipments</h2>
       <div style="display:flex;gap:8px;align-items:center">
+        <button class="btn btn-ghost btn-sm" id="wanhaiBtn" onclick="dispatchWanhai()" title="Trigger the Wan Hai scraper now (GitHub Actions)">🛰️ Refresh Wan Hai</button>
         <button class="btn btn-ghost btn-sm" id="refreshBtn" onclick="refreshAll()">🔄 Refresh All</button>
         <a href="https://docs.google.com/spreadsheets/d/1e1smHhHSIZ89xltCWhDuK-tQI0LqQN7a0tPSxyLeZzs/edit?gid=120157833"
            target="_blank" class="btn btn-ghost btn-sm">📊 Google Sheet</a>
@@ -621,6 +622,7 @@ tbody td {
             <th>ETA</th>
             <th>Status</th>
             <th>Updated</th>
+            <th>Freshness</th>
             <th>Actions</th>
           </tr>
         </thead>
@@ -965,7 +967,7 @@ function del(bl) {
 function renderTable() {
   const tb = document.getElementById('tBody');
   if (!DATA.length) {
-    tb.innerHTML = `<tr><td colspan="11">
+    tb.innerHTML = `<tr><td colspan="12">
       <div class="empty">
         <div class="empty-icon">🚢</div>
         <h3>No shipments tracked yet</h3>
@@ -996,6 +998,7 @@ function renderTable() {
       <td class="muted">${fmtDate(r.eta)||'—'}</td>
       <td>${statusBadge(r.status)}</td>
       <td class="dim">${fmtDate(r.lastUpdated)||'—'}</td>
+      <td>${freshnessBadge(r.lastUpdated, r.carrier)}</td>
       <td style="white-space:nowrap;display:flex;gap:6px;flex-wrap:wrap">
         ${trackLink}
         ${editBtn}
@@ -1013,6 +1016,79 @@ function statusBadge(s) {
   if (/error|not.found|invalid/.test(low))                   return `<span class="badge badge-red">Error</span>`;
   if (/pending|syncing/.test(low)||!s)                       return `<span class="badge badge-purple">Pending</span>`;
   return `<span class="badge badge-gray">${esc(s)}</span>`;
+}
+
+// ============================================================
+//  FRESHNESS — how long ago this row was last written.
+//  Wan Hai rows are scraped on a 3-hourly schedule, so anything older than
+//  ~4h means a scrape was missed; flag it amber. ONE Line refreshes locally
+//  every 5 min, so it uses a tighter threshold.
+// ============================================================
+function freshnessBadge(lastUpdated, carrier) {
+  if (!lastUpdated) return `<span class="badge badge-gray">—</span>`;
+  const t = new Date(lastUpdated);
+  if (isNaN(t)) return `<span class="badge badge-gray">—</span>`;
+  const mins = Math.round((Date.now() - t.getTime()) / 60000);
+  const isWanhai = (carrier || '').toUpperCase() === 'WANHAI';
+  const staleMins = isWanhai ? 240 : 30;   // 4h for Wan Hai, 30 min for ONE
+  let label;
+  if (mins < 1)        label = 'just now';
+  else if (mins < 60)  label = mins + 'm ago';
+  else if (mins < 1440)label = Math.round(mins/60) + 'h ago';
+  else                 label = Math.round(mins/1440) + 'd ago';
+  const cls = mins <= staleMins ? 'badge-green' : (mins <= staleMins*2 ? 'badge-amber' : 'badge-red');
+  return `<span class="badge ${cls}" title="Last updated ${t.toLocaleString('id-ID')}">${label}</span>`;
+}
+
+// ============================================================
+//  TRIGGER WAN HAI SCRAPER ON DEMAND (GitHub Actions workflow_dispatch)
+//  The scraper lives in GitHub Actions because Wan Hai blocks datacenter IPs
+//  and the scheduled run is only every 3h — this lets you force a fresh scrape
+//  right now. Needs a fine-grained PAT with "Actions: write" on the repo,
+//  stored locally (never committed). Set it once via the console:
+//    localStorage.setItem('gh_dispatch_token','github_pat_...')
+//  After dispatch, the sheet updates in ~1–2 min; pullFromSheet() then surfaces it.
+// ============================================================
+async function dispatchWanhai() {
+  const btn = document.getElementById('wanhaiBtn');
+  const token = localStorage.getItem('gh_dispatch_token');
+  if (!token) {
+    toast('⚠️ Set a GitHub token first: localStorage.setItem("gh_dispatch_token","github_pat_…") — needs Actions:write', 'err');
+    return;
+  }
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Dispatching…';
+  try {
+    const res = await fetch(
+      'https://api.github.com/repos/Tito3nity/one-line-cargo-monitor/actions/workflows/wanhai-scrape.yml/dispatches',
+      {
+        method: 'POST',
+        headers: {
+          'Accept': 'application/vnd.github+json',
+          'Authorization': 'Bearer ' + token,
+          'X-GitHub-Api-Version': '2022-11-28'
+        },
+        body: JSON.stringify({ ref: 'main' })
+      }
+    );
+    if (res.status === 204) {
+      toast('🛰️ Wan Hai scrape started — sheet updates in ~1–2 min, then pulls in automatically', 'ok');
+      // Poll the sheet a few times so the new data appears without a manual refresh.
+      let n = 0;
+      const poll = setInterval(async () => {
+        n++; await pullFromSheet();
+        if (n >= 8) clearInterval(poll);   // ~8 pulls over ~2 min (15s apart)
+      }, 15000);
+    } else {
+      const txt = await res.text();
+      toast(`⚠️ Dispatch failed (HTTP ${res.status}). Check token scope (Actions:write).`, 'err');
+      console.warn('dispatch failed', res.status, txt);
+    }
+  } catch (e) {
+    toast('⚠️ Dispatch error — see console', 'err');
+    console.warn('dispatchWanhai error', e);
+  } finally {
+    btn.disabled = false; btn.innerHTML = '🛰️ Refresh Wan Hai';
+  }
 }
 
 // ============================================================
