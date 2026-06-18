@@ -379,24 +379,55 @@ async function attemptForm(browser, ref) {
             console.log(`[WHL]   detail: popup opened -> ${popup2.url().split('/').pop()}`);
             await popup2.bringToFront().catch(() => {});
 
-            // The *_redirect.xhtml page is a shell that forwards (meta-refresh /
-            // JS / server redirect) to the real detail page. Wait for the URL to
-            // leave the redirect shell first...
+            // The *_redirect.xhtml page is a shell that should forward to the
+            // real detail page. Wait for it to leave the shell...
             await popup2.waitForFunction(
               () => !/_redirect\.xhtml/i.test(location.href),
-              { timeout: 20000, polling: 400 }
+              { timeout: 12000, polling: 400 }
             ).catch(() => {});
-            // ...then wait for the detail document to actually render its tables.
-            await popup2.waitForFunction(
-              () => {
-                const t = document.body ? document.body.innerText : '';
-                return document.querySelectorAll('table').length > 0 &&
-                       /ctnr no|place of receipt|port of discharg|estimated|laden|container|vessel/i.test(t);
-              },
-              { timeout: 25000, polling: 500 }
-            ).catch(() => {});
-            // Extra settle for any late ajax population.
-            await new Promise(r => setTimeout(r, 2000));
+
+            // LIVE-OBSERVED: the redirect shell sometimes never forwards and
+            // stays blank (tables:0) — it was opened as a cold GET without the
+            // POST/session context it needs. When that happens, drive the popup
+            // ourselves to the NON-redirect detail page, reusing the booking
+            // params from the shell URL. The popup shares the browser's session
+            // cookies, so the direct page resolves. Try by_booking then by_bl.
+            let stillShell = /_redirect\.xhtml/i.test(popup2.url());
+            let blank = await popup2.evaluate(
+              () => document.querySelectorAll('table').length === 0
+            ).catch(() => true);
+            if (stillShell || blank) {
+              const su = popup2.url();
+              const refNo  = (su.match(/[?&]ref_no=([^&]+)/i)  || [])[1] || encodeURIComponent(ref);
+              const refTyp = (su.match(/[?&]ref_type=([^&]+)/i) || [])[1] || 'BKG';
+              const directBase = 'https://www.wanhai.com/views/cargo_track_v2/';
+              const candidates = [
+                directBase + 'tracking_data_page_by_booking.xhtml?ref_no=' + refNo + '&ref_type=' + refTyp,
+                directBase + 'tracking_data_page_by_bl.xhtml?ref_no=' + refNo + '&ref_type=' + refTyp,
+              ];
+              for (const cand of candidates) {
+                console.log(`[WHL]   detail: shell blank, trying direct -> ${cand.split('/').pop()}`);
+                await popup2.goto(cand, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+                if (ERROR_PAGE_RE.test(popup2.url())) continue;
+                await popup2.waitForFunction(
+                  () => document.querySelectorAll('table').length > 0 &&
+                        /ctnr no|place of receipt|port of discharg|estimated|laden|container|vessel/i.test(document.body.innerText || ''),
+                  { timeout: 18000, polling: 500 }
+                ).catch(() => {});
+                const ok = await popup2.evaluate(
+                  () => document.querySelectorAll('table').length > 0
+                ).catch(() => false);
+                if (ok) break;
+              }
+            } else {
+              // Shell forwarded normally — just wait for content to render.
+              await popup2.waitForFunction(
+                () => document.querySelectorAll('table').length > 0 &&
+                      /ctnr no|place of receipt|port of discharg|estimated|laden|container|vessel/i.test(document.body.innerText || ''),
+                { timeout: 20000, polling: 500 }
+              ).catch(() => {});
+            }
+            await new Promise(r => setTimeout(r, 1500));
             console.log(`[WHL]   detail: popup settled -> ${popup2.url().split('/').pop()}`);
             target = popup2;   // parse the popup from here on
           } else {
