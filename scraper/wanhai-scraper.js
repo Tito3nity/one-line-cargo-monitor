@@ -332,22 +332,22 @@ async function attemptDeepLink(browser, ref) {
       { timeout: 20000, polling: 500 }
     ).catch(() => {});
 
-    const finalUrl = page.url();
+    const preUrl = page.url();
     const tblCount = await page.evaluate(() => document.querySelectorAll('table').length).catch(() => 0);
-    console.log(`[WHL]   deeplink: final=${finalUrl.split('/').pop()} tables=${tblCount} ` +
-                `shell=${/_redirect\.xhtml/i.test(finalUrl)}`);
+    console.log(`[WHL]   deeplink: pre-forward=${preUrl.split('/').pop()} tables=${tblCount} ` +
+                `shell=${/_redirect\.xhtml/i.test(preUrl)}`);
 
     // If we're still stuck on the shell, dump its forward logic so we can see
     // EXACTLY what gates the redirect (it's a small page). Look at inline
     // scripts mentioning location/submit/forward, any forms + their action, and
     // body onload — the shell's redirect condition lives in one of these.
-    if (/_redirect\.xhtml/i.test(finalUrl)) {
+    if (/_redirect\.xhtml/i.test(preUrl)) {
       const probe = await page.evaluate(() => {
         const pick = [];
         for (const s of document.querySelectorAll('script')) {
           const t = s.textContent || '';
-          if (/location|submit|forward|window\.open|href|ref_no|setTimeout|onload/i.test(t)) {
-            pick.push(t.replace(/\s+/g, ' ').trim().slice(0, 500));
+          if (/location|submit|forward|window\.open|href|ref_no|setTimeout|onload|autoLink|click/i.test(t)) {
+            pick.push(t.replace(/\s+/g, ' ').trim().slice(0, 1200));
           }
         }
         const forms = [...document.querySelectorAll('form')].map(f => ({
@@ -372,8 +372,53 @@ async function attemptDeepLink(browser, ref) {
       console.log('[WHL]   SHELLJS: ' + JSON.stringify(probe).slice(0, 1900));
     }
 
-    // The data may render inside an IFRAME on the shell (common for JSF detail
-    // popups). If so, parse the iframe's document instead of the main frame.
+    // THE SHELL'S OWN FORWARD MECHANISM (from SHELLJS dump): window.onload
+    // finds elements whose id contains "autoLink_", matches one to ref_no, and
+    // clicks it to forward to the detail page. On a cold GET these autoLinks
+    // may render a beat late (JSF), so: wait for them, then drive the forward
+    // ourselves (re-running the same logic the onload would), and click the
+    // matching link. This is doing exactly what the page does.
+    await page.waitForFunction(
+      () => document.querySelectorAll('[id*="autoLink_"]').length > 0,
+      { timeout: 8000, polling: 300 }
+    ).catch(() => {});
+    const autoFwd = await page.evaluate((refNo) => {
+      const out = { autoLinks: [], clicked: false, matched: '' };
+      const links = [...document.querySelectorAll('[id*="autoLink_"]')];
+      out.autoLinks = links.slice(0, 8).map(a =>
+        `${a.id}|ref=${a.getAttribute('data-ref_no')||a.getAttribute('ref_no')||''}|oc=${(a.getAttribute('onclick')||'').slice(0,40)}|txt=${(a.textContent||'').trim().slice(0,20)}`);
+      let target = links.find(a =>
+        (a.getAttribute('data-ref_no') || a.getAttribute('ref_no') || a.textContent || a.getAttribute('onclick') || '')
+          .toUpperCase().includes(refNo.toUpperCase()));
+      if (!target && links.length === 1) target = links[0];
+      if (target) {
+        out.matched = target.id;
+        target.removeAttribute('target');
+        target.click();
+        out.clicked = true;
+      } else if (typeof window.onload === 'function') {
+        try { window.onload(); out.ranOnload = true; } catch (e) { out.onloadErr = String(e).slice(0,60); }
+      }
+      return out;
+    }, ref).catch(e => ({ err: e.message }));
+    console.log('[WHL]   AUTOFWD: ' + JSON.stringify(autoFwd).slice(0, 600));
+
+    // After firing the forward, wait for the detail content (new tables / fields).
+    if (autoFwd.clicked || autoFwd.ranOnload) {
+      await page.waitForFunction(
+        () => document.querySelectorAll('table').length > 1 ||
+              /ctnr no|place of receipt|port of discharg|estimated|laden/i.test(document.body?.innerText || ''),
+        { timeout: 20000, polling: 500 }
+      ).catch(() => {});
+      await new Promise(r => setTimeout(r, 2500));
+      console.log(`[WHL]   AUTOFWD after: url=${page.url().split('/').pop()} ` +
+                  `tables=${await page.evaluate(()=>document.querySelectorAll('table').length).catch(()=>0)}`);
+    }
+
+    const finalUrl = page.url();
+    if (ERROR_PAGE_RE.test(finalUrl)) throw new Error('deep link bounced to error page');
+
+    // Data may now be in the main frame OR an iframe the forward opened.
     let parseTarget = page;
     for (const fr of page.frames()) {
       if (fr === page.mainFrame()) continue;
@@ -387,10 +432,8 @@ async function attemptDeepLink(browser, ref) {
       }
     }
 
-    if (ERROR_PAGE_RE.test(finalUrl)) throw new Error('deep link bounced to error page');
-
     const tables = await readTables(parseTarget);
-    if (!hasResult(tables, ref)) throw new Error('deep link: tables present but no recognizable result rows (see SHELLJS dump)');
+    if (!hasResult(tables, ref)) throw new Error('deep link: tables present but no recognizable result rows (see SHELLJS/AUTOFWD dump)');
 
     const rec = parseFromTables(tables, ref);
     rec.sourceUrl = finalUrl;
