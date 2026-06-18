@@ -268,299 +268,9 @@ async function attemptForm(browser, ref) {
     const rec = parseFromTables(tables, ref);
     rec.sourceUrl = target.url();
 
-    // ── LIST-PAGE PROBE (temporary): the detail page needs a JSF POST we can't
-    // reproduce by GET, so before drilling, inspect what the LIST page itself
-    // already holds — it often contains a hidden/expandable container section,
-    // and the postback may also populate THIS page in place. Dump structure +
-    // every label:value-ish pair + the BL row's anchors (id/onclick) so we can
-    // target the right control or read data that's already present.
-    const listProbe = await target.evaluate((refNo) => {
-      const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
-      const out = { url: location.href, tables: 0, forms: [], anchors: [], ctnrCtx: [], allTextLen: 0 };
-      out.tables = document.querySelectorAll('table').length;
-      out.allTextLen = clean(document.body.innerText).length;
-      // Forms + their key hidden inputs (ViewState etc.) — confirms the POST shape.
-      for (const f of document.querySelectorAll('form')) {
-        out.forms.push({
-          id: f.id, action: (f.getAttribute('action') || '').slice(0, 80),
-          inputs: [...f.querySelectorAll('input')].slice(0, 12)
-            .map(i => `${i.name || i.id}=${(i.value || '').slice(0, 20)}`)
-        });
-      }
-      // Every anchor's id + onclick (to find the real container/detail trigger).
-      out.anchors = [...document.querySelectorAll('a')].slice(0, 12).map(a =>
-        `id=${a.id || '-'} txt="${clean(a.innerText).slice(0, 24)}" oc="${(a.getAttribute('onclick') || '').slice(0, 70)}"`);
-      // Context around container-ish keywords anywhere in the DOM text.
-      const body = document.body.innerText || '';
-      for (const kw of ['Ctnr', 'Container', 'WHSU', 'Estimated', 'Arrival', 'Discharge', 'Receipt', 'Laden', 'Gate']) {
-        const i = body.indexOf(kw);
-        if (i >= 0) out.ctnrCtx.push(kw + ':«' + clean(body.slice(i, i + 70)) + '»');
-      }
-      return out;
-    }, ref).catch(e => ({ probeErr: e.message }));
-    console.log('[WHL]   LISTPROBE: ' + JSON.stringify(listProbe).slice(0, 1400));
-
-    // ── DETAIL DRILL-DOWN ──────────────────────────────────────────────
-    // The list view (tracking_data_list.xhtml) only carries BL / Onboard /
-    // Voyage / Vessel + a "More detail" link. Container No., type, ports and
-    // ETA live on the DETAIL page (tracking_data_page_by_bl.xhtml) behind that
-    // link. If we don't yet have those, click through and merge them in.
-    // VERIFIED LIVE: the list row's last cell is a "More detail" anchor that
-    // navigates same-tab to tracking_data_page_by_bl.xhtml.
-    const needsDetail = !rec.containerNo || !rec.eta || !rec.destination;
-    if (needsDetail) {
-      try {
-        const beforeUrl = target.url();
-
-        // ── ATTEMPT 0: in-session fetch, following client-side forwards ────
-        // The redirect endpoint returns a 200 HTML *shell* that forwards via JS
-        // or <meta refresh> (not a server 302), so fetch() lands on the shell.
-        // We read the shell, extract its forward target (meta refresh / location
-        // assignment / form action), and fetch THAT — looping up to 3 hops — all
-        // inside the page's own session. This is the headless-safe equivalent of
-        // letting the browser follow the forward.
-        const fetched = await target.evaluate(async (refNo) => {
-          const log = [];
-          const start = '/views/cargo_track_v2/tracking_data_page_by_bl_redirect.xhtml'
-                      + '?ref_no=' + encodeURIComponent(refNo) + '&ref_type=MFT';
-          const ctnrRe = /Ctnr\s*No|Container\s*No|WHSU|Place of Receipt|Port of Discharg/i;
-          const abs = (u, base) => { try { return new URL(u, base).href; } catch { return null; } };
-
-          // Extract a forward target from shell HTML: meta-refresh, JS location
-          // assignments, window.open, or a single auto-submit form.
-          const findForward = (html, baseUrl) => {
-            let m;
-            m = html.match(/<meta[^>]*http-equiv=["']?refresh["']?[^>]*content=["'][^"']*url=([^"'>\s]+)/i);
-            if (m) return { kind:'meta', url: abs(m[1], baseUrl) };
-            m = html.match(/(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']/i)
-             || html.match(/location\.replace\(\s*["']([^"']+)["']\s*\)/i)
-             || html.match(/window\.open\(\s*["']([^"']+)["']/i);
-            if (m) return { kind:'js', url: abs(m[1], baseUrl) };
-            // Auto-submit form: take action + serialize inputs for a GET/POST.
-            const fm = html.match(/<form[^>]*action=["']([^"']+)["'][^>]*>([\s\S]*?)<\/form>/i);
-            if (fm) {
-              const action = abs(fm[1], baseUrl);
-              const method = (fm[0].match(/method=["']?(\w+)/i) || [,'get'])[1].toLowerCase();
-              const inputs = {};
-              const re = /<input[^>]*name=["']([^"']+)["'][^>]*value=["']([^"']*)["']/gi; let im;
-              while ((im = re.exec(fm[2]))) inputs[im[1]] = im[2];
-              return { kind:'form', url: action, method, inputs };
-            }
-            return null;
-          };
-
-          try {
-            let url = start, html = '', finalUrl = start, hops = 0;
-            for (hops = 0; hops < 4; hops++) {
-              const fwd0 = (hops === 0) ? null : findForward(html, finalUrl);
-              let r;
-              if (fwd0 && fwd0.kind === 'form' && fwd0.method === 'post') {
-                const body = new URLSearchParams(fwd0.inputs);
-                r = await fetch(fwd0.url, { method:'POST', credentials:'include', redirect:'follow',
-                                            headers:{'Content-Type':'application/x-www-form-urlencoded'}, body });
-              } else {
-                const next = (hops === 0) ? url : (fwd0 ? (fwd0.kind==='form'
-                              ? fwd0.url + '?' + new URLSearchParams(fwd0.inputs) : fwd0.url) : null);
-                if (!next) break;
-                r = await fetch(next, { credentials:'include', redirect:'follow' });
-              }
-              html = await r.text();
-              finalUrl = r.url || finalUrl;
-              log.push(`hop${hops}:${(finalUrl.split('/').pop()||'').slice(0,40)} len=${html.length} ctnr=${ctnrRe.test(html)}`);
-              if (ctnrRe.test(html)) break;
-              if (hops > 0 && !findForward(html, finalUrl)) break;
-            }
-            return { ok:true, finalUrl, len:html.length, hasCtnr:ctnrRe.test(html), log,
-                     shellHead: html.slice(0, 600).replace(/\s+/g,' '),
-                     html: html.length < 400000 ? html : html.slice(0,400000) };
-          } catch (e) { return { ok:false, err:String(e).slice(0,120), log }; }
-        }, ref).catch(e => ({ ok:false, err:e.message }));
-        console.log(`[WHL]   detail FETCH0: ok=${fetched.ok} hasCtnr=${fetched.hasCtnr} ` +
-                    `final=${(fetched.finalUrl||'').split('/').pop()} hops=${JSON.stringify(fetched.log||[])} err="${fetched.err||''}"`);
-        if (fetched.shellHead && !fetched.hasCtnr)
-          console.log(`[WHL]   detail SHELLHEAD: ${fetched.shellHead}`);
-
-        if (fetched.ok && fetched.hasCtnr && fetched.html) {
-          // Parse the fetched detail HTML in a throwaway DOM via the page.
-          const detail = await target.evaluate((html, refNo) => {
-            const doc = new DOMParser().parseFromString(html, 'text/html');
-            const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
-            const rowsByTable = [];
-            for (const tbl of doc.querySelectorAll('table')) {
-              const rows = [...tbl.querySelectorAll('tr')].map(tr =>
-                [...tr.querySelectorAll('td,th')].map(td => clean(td.textContent)));
-              if (rows.some(r => r.some(c => c.length))) rowsByTable.push(rows);
-            }
-            const flat = []; for (const rs of rowsByTable) for (const r of rs) flat.push(r);
-            const out = { containerNo:'', type:'', origin:'', destination:'', eta:'', etd:'', status:'' };
-            // Container block: header with Ctnr No + Current Status, then rows.
-            let inCtnr = false; const ctnrs = [];
-            for (const row of flat) {
-              const j = row.join(' ').toLowerCase();
-              if (j.includes('ctnr no') && j.includes('current status')) { inCtnr = true; continue; }
-              if (inCtnr && /^[A-Z]{4}\d{6,7}$/.test((row[1]||'').trim()))
-                ctnrs.push({ no: row[1].trim(), tp: (row[2]||'').trim(), st: (row[7]||row[row.length-2]||'').trim() });
-            }
-            if (ctnrs.length) {
-              out.containerNo = ctnrs.map(c=>c.no).join(', ');
-              out.type = ctnrs.map(c=>c.tp).filter(Boolean).join(', ');
-              out.status = ctnrs[0].st || '';
-            }
-            // Ports / dates.
-            for (const row of flat) {
-              const head=(row[0]||'').toLowerCase(), loc=(row[1]||'').trim(), date=(row[row.length-1]||'').trim();
-              if (head.startsWith('place of receipt')||head.startsWith('port of loading')) {
-                if (!out.origin && loc && loc!=='---') out.origin=loc;
-                if (/depart/i.test(row.join(' ')) && date) out.etd=date;
-              } else if (head.startsWith('port of discharg')||head.startsWith('place of delivery')) {
-                if (loc && loc!=='---') out.destination=loc;
-                if (/arriv/i.test(row.join(' ')) && date) out.eta=date;
-              }
-            }
-            return out;
-          }, fetched.html, ref).catch(e => ({ _err: e.message }));
-
-          console.log(`[WHL]   detail FETCH0 parsed: ctnr="${detail.containerNo||''}" type="${detail.type||''}" ` +
-                      `dest="${detail.destination||''}" eta="${detail.eta||''}"`);
-          if (detail && (detail.containerNo || detail.eta || detail.destination)) {
-            rec.containerNo = rec.containerNo || detail.containerNo;
-            rec.type        = rec.type        || detail.type;
-            rec.origin      = rec.origin      || detail.origin;
-            rec.destination = rec.destination || detail.destination;
-            rec.eta         = rec.eta         || detail.eta;
-            rec.etd         = rec.etd         || detail.etd;
-            if (detail.status && /transit|discharg|arriv|deliver|load|gate|empty|full/i.test(detail.status))
-              rec.status = detail.status;
-            rec.detailDiag = `det:fetch0/ctnr:${detail.containerNo?'y':'n'}/eta:${detail.eta?'y':'n'}`;
-          }
-        }
-
-        // If fetch0 already populated the detail, skip the popup dance entirely.
-        const stillNeed = !rec.containerNo && !rec.eta && !rec.destination;
-        if (!stillNeed) {
-          console.log('[WHL]   detail: fetch0 satisfied — skipping popup');
-        } else {
-        //   window.open('/views/cargo_track_v2/tracking_data_page_by_bl_redirect.xhtml?ref_no=..&ref_type=MFT','_blank')
-        // i.e. it opens the BL detail in a popup. We register a popup listener,
-        // call the fn, then wait on that popup for the redirect shell to forward
-        // to the rendered detail page. ref_type MUST be 'MFT' for B/L data.
-        let detailPopup = null;
-        const onTarget = async (t) => {
-          try {
-            if (t.type && t.type() === 'page') {
-              const p = await t.page();
-              if (p) detailPopup = p;
-            }
-          } catch (_) {}
-        };
-        browser.on('targetcreated', onTarget);
-
-        const fnInfo = await target.evaluate((refNo) => {
-          const out = { called: false, fnSrc: '' };
-          if (typeof window.formblSubmit === 'function') {
-            out.fnSrc = String(window.formblSubmit).replace(/\s+/g, ' ').slice(0, 200);
-            try { window.formblSubmit(refNo, 'MFT'); out.called = true; } catch (e) { out.err = String(e).slice(0,80); }
-          } else {
-            // Fallback: click the B/L Data anchor (its onclick calls the fn).
-            const a = [...document.querySelectorAll('a')]
-              .find(x => /formblSubmit|B\/?L\s*Data/i.test((x.getAttribute('onclick')||'')+' '+(x.innerText||'')));
-            if (a) { a.removeAttribute('target');
-              a.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window})); out.called = true; }
-          }
-          return out;
-        }, ref).catch(e => ({ called:false, err:e.message }));
-        console.log(`[WHL]   detail: formblSubmit called=${fnInfo.called} err="${fnInfo.err||''}"`);
-
-        // Wait up to ~6s for the popup to be created by window.open.
-        for (let i = 0; i < 24 && !detailPopup; i++) await new Promise(r => setTimeout(r, 250));
-        browser.off('targetcreated', onTarget);
-
-        if (detailPopup) {
-          popup2 = detailPopup;
-          await popup2.bringToFront().catch(() => {});
-          console.log(`[WHL]   detail: popup -> ${popup2.url().split('/').pop()}`);
-
-          // Wait for the redirect shell to forward off *_redirect.xhtml AND for
-          // real content to render. The shell uses a client-side forward, so it
-          // needs a moment; give it a generous budget.
-          await popup2.waitForFunction(
-            () => !/_redirect\.xhtml/i.test(location.href) &&
-                  document.querySelectorAll('table').length > 0,
-            { timeout: 25000, polling: 400 }
-          ).catch(() => {});
-
-          // If it's still stuck on the shell, reload it ONCE in this same popup
-          // (which now holds the forwarded session) to nudge the forward.
-          if (/_redirect\.xhtml/i.test(popup2.url())) {
-            console.log('[WHL]   detail: shell stalled, reloading popup once');
-            await popup2.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-            await popup2.waitForFunction(
-              () => document.querySelectorAll('table').length > 0 &&
-                    /ctnr|vessel|discharg|receipt|estimated|laden/i.test(document.body.innerText||''),
-              { timeout: 20000, polling: 500 }
-            ).catch(() => {});
-          }
-          await new Promise(r => setTimeout(r, 2000));
-          console.log(`[WHL]   detail: popup settled -> ${popup2.url().split('/').pop()}`);
-          target = popup2;
-        } else {
-          console.log('[WHL]   detail: no popup opened');
-        }
-
-        {
-          const afterUrl = target.url();
-          console.log(`[WHL]   detail: ${beforeUrl.split('/').pop()} -> ${afterUrl.split('/').pop()} ` +
-                      `errorPage=${ERROR_PAGE_RE.test(afterUrl)}`);
-
-          if (!ERROR_PAGE_RE.test(afterUrl)) {
-            // ── STRUCTURAL PROBE (temporary): log how the detail content is laid
-            // out so the parser can be fixed exactly. Safe to remove later.
-            const probe = await target.evaluate(() => {
-              const out = { tables: 0, divs: 0, uls: 0, dls: 0, ctnrCtx: [], labels: [] };
-              out.tables = document.querySelectorAll('table').length;
-              out.divs   = document.querySelectorAll('div').length;
-              out.uls    = document.querySelectorAll('ul').length;
-              out.dls    = document.querySelectorAll('dl').length;
-              const body = document.body.innerText || '';
-              for (const kw of ['Ctnr', 'Container', 'Estimated', 'Arrival', 'Discharge', 'Receipt', 'Laden', 'WHSU']) {
-                const i = body.indexOf(kw);
-                if (i >= 0) out.ctnrCtx.push(kw + ':«' + body.slice(i, i + 80).replace(/\s+/g, ' ') + '»');
-              }
-              const hint = [...document.querySelectorAll('[id*="ctnr"],[id*="container"],[class*="ctnr"],[class*="container"]')]
-                .slice(0, 5).map(e => (e.tagName + '#' + (e.id || '') + '.' + (e.className || '')).slice(0, 60));
-              out.hintEls = hint;
-              return out;
-            }).catch(e => ({ probeErr: e.message }));
-            console.log('[WHL]   PROBE: ' + JSON.stringify(probe).slice(0, 900));
-
-            const detailTables = await readTables(target);
-            const detail = parseFromTables(detailTables, ref);
-            console.log(`[WHL]   detail parsed: ctnr="${detail.containerNo}" type="${detail.type}" ` +
-                        `dest="${detail.destination}" eta="${detail.eta}" tables=${detailTables.length}`);
-            rec.containerNo = rec.containerNo || detail.containerNo;
-            rec.type        = rec.type        || detail.type;
-            rec.origin      = rec.origin      || detail.origin;
-            rec.destination = rec.destination || detail.destination;
-            rec.eta         = rec.eta         || detail.eta;
-            rec.etd         = rec.etd         || detail.etd;
-            if (detail.status && /transit|discharg|arriv|deliver|load|gate|empty|full/i.test(detail.status)) {
-              rec.status = detail.status;
-            }
-            rec.sourceUrl = afterUrl;
-            // Diagnostic breadcrumb that survives shape(): records what the detail
-            // step yielded, so a blank result is explainable from the sheet alone.
-            rec.detailDiag = `det:${detailTables.length}t/ctnr:${detail.containerNo?'y':'n'}/eta:${detail.eta?'y':'n'}`;
-          } else {
-            rec.detailDiag = 'det:errorpage';
-          }
-        }
-        } // end stillNeed (popup fallback) block
-      } catch (e) {
-        rec.detailErr = e.message;
-        rec.detailDiag = 'det:exc:' + (e.message || '').slice(0, 40);
-        console.log(`[WHL]   detail EXC: ${e.message}`);
-      }
-    }
+    // Detail fields (container/ETA/ports) come from the SeaRates API in
+    // scrapeWanHai(); this scraper fallback returns list-view vessel/voyage/
+    // status only. The detail page is unreachable headless (JS redirect shell).
 
     return rec;
   } finally {
@@ -582,25 +292,58 @@ async function attemptDeepLink(browser, ref) {
 
     const url = REDIRECT_EP +
       '?ref_no=' + encodeURIComponent(ref) + '&ref_type=MFT';
-    // LIVE-VERIFIED: this deep link frequently hangs on a "loading..." shell and
-    // never resolves the tables. So we navigate with a short budget and then
-    // give the tables a bounded chance to appear — if they don't, we bail fast
-    // and let the (reliable) form flow have already done the job. This attempt
-    // is a fallback only; it must never stall the whole run.
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
 
+    // KEY INSIGHT: the redirect shell forwards via client-side JS. A popup loses
+    // window.opener (so its forward dies), and fetch() can't run JS at all — but
+    // a MAIN-FRAME page.goto() executes the shell's JS with the opener/referer
+    // intact, exactly like a real browser. So navigate the main page here and
+    // then WAIT FOR THE FORWARD to carry us off *_redirect.xhtml onto the real
+    // detail page, instead of bailing on the still-loading shell.
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
     if (ERROR_PAGE_RE.test(page.url())) throw new Error('deep link bounced to error page');
 
-    await page
-      .waitForFunction(() => document.querySelector('table.tbl-list'),
-        { timeout: 12000, polling: 500 })
-      .catch(() => {});
+    // Wait for the client-side forward to leave the redirect shell. The shell
+    // may use meta-refresh, location=, or a JSF/JS forward — all of which run
+    // during a real navigation. Give it a generous budget.
+    await page.waitForFunction(
+      () => !/_redirect\.xhtml/i.test(location.href),
+      { timeout: 25000, polling: 400 }
+    ).catch(() => {});
+
+    // If the shell didn't auto-forward, try nudging it: some WHL shells expose a
+    // doSubmit()/forward() or a body onload that needs a tick, and a reload of
+    // the shell (now that the session/referer is set) often forwards on the 2nd
+    // load. Reload once if we're still on the shell.
+    if (/_redirect\.xhtml/i.test(page.url())) {
+      console.log('[WHL]   deeplink: still on shell, reloading once');
+      await page.reload({ waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
+      await page.waitForFunction(
+        () => !/_redirect\.xhtml/i.test(location.href) ||
+              document.querySelectorAll('table').length > 0,
+        { timeout: 20000, polling: 400 }
+      ).catch(() => {});
+    }
+
+    // Now wait for the real detail content (tables with container/port/ETA text).
+    await page.waitForFunction(
+      () => document.querySelectorAll('table').length > 0 &&
+            /ctnr no|place of receipt|port of discharg|estimated|laden|container|vessel/i
+              .test(document.body.innerText || ''),
+      { timeout: 20000, polling: 500 }
+    ).catch(() => {});
+
+    const finalUrl = page.url();
+    const tblCount = await page.evaluate(() => document.querySelectorAll('table').length).catch(() => 0);
+    console.log(`[WHL]   deeplink: final=${finalUrl.split('/').pop()} tables=${tblCount} ` +
+                `shell=${/_redirect\.xhtml/i.test(finalUrl)}`);
+
+    if (ERROR_PAGE_RE.test(finalUrl)) throw new Error('deep link bounced to error page');
 
     const tables = await readTables(page);
-    if (!hasResult(tables, ref)) throw new Error('deep link still loading / no tables');
+    if (!hasResult(tables, ref)) throw new Error('deep link: no result tables (shell did not forward)');
 
     const rec = parseFromTables(tables, ref);
-    rec.sourceUrl = page.url();
+    rec.sourceUrl = finalUrl;
     return rec;
   } finally {
     await page.close().catch(() => {});
@@ -611,23 +354,69 @@ async function attemptDeepLink(browser, ref) {
 
 async function scrapeWanHai(browser, bl) {
   const ref = String(bl).trim().toUpperCase();
-  const attempts = [attemptForm, attemptDeepLink];
+
+  // ── PRIMARY: extract everything from Wan Hai's own page ────────────────────
+  // Two complementary page paths, merged for the most complete record:
+  //   • attemptForm     — reliably yields the list view (vessel/voyage/status).
+  //   • attemptDeepLink — navigates the MAIN frame to the redirect URL and lets
+  //     the shell's JS forward fire (opener/referer intact), reaching the full
+  //     detail page (container No / type / ports / ETA).
+  // We run both (deep link first, since it carries the detail fields) and merge.
+  let merged = null;
   let lastErr = '';
 
-  for (const attempt of attempts) {
-    for (let tries = 0; tries < 2; tries++) {   // one retry each (session may need a beat)
+  const runAttempt = async (fn, label) => {
+    for (let tries = 0; tries < 2; tries++) {
       try {
-        const r = await attempt(browser, ref);
-        if (r && (r.vessel || r.voyage || r.containerNo || r.eta)) {
-          return shape(ref, r, true);
-        }
-        lastErr = 'empty result';
+        const r = await fn(browser, ref);
+        if (r && (r.vessel || r.voyage || r.containerNo || r.eta)) return r;
+        lastErr = label + ': empty result';
       } catch (e) {
-        lastErr = e.message;
+        lastErr = label + ': ' + e.message;
+        console.log(`[WHL]   ${label} failed: ${e.message}`);
       }
       await new Promise((res) => setTimeout(res, 1500));
     }
+    return null;
+  };
+
+  // Deep link first — it's the one that can reach container/ETA.
+  const deep = await runAttempt(attemptDeepLink, 'deeplink');
+  if (deep) merged = { ...deep };
+
+  // Run the form flow if we still lack the list-view basics or detail fields.
+  const needBasics = !merged || !merged.vessel || !merged.voyage;
+  if (needBasics) {
+    const form = await runAttempt(attemptForm, 'form');
+    if (form) {
+      // Merge: keep any field already populated; fill blanks from the other path.
+      merged = {
+        ...(form || {}),
+        ...Object.fromEntries(Object.entries(merged || {}).filter(([, v]) => v)),
+      };
+      // Ensure detail fields from deep link aren't lost if form had blanks.
+      if (deep) for (const k of ['containerNo', 'type', 'origin', 'destination', 'eta', 'etd']) {
+        if (!merged[k] && deep[k]) merged[k] = deep[k];
+      }
+    }
   }
+
+  if (merged && (merged.vessel || merged.voyage || merged.containerNo || merged.eta)) {
+    return shape(ref, merged, true);
+  }
+
+  // ── LAST RESORT: SeaRates API (only if a key is configured) ───────────────
+  try {
+    const { fetchWanHaiFromApi } = require('./wanhai-api');
+    const api = await fetchWanHaiFromApi(ref, { forceUpdate: false });
+    if (api && (api.containerNo || api.eta || api.vessel)) {
+      console.log(`[WHL] ${ref} -> page failed; SeaRates fallback OK`);
+      return api;
+    }
+  } catch (e) {
+    console.log(`[WHL] SeaRates fallback also failed: ${e.message}`);
+  }
+
   return shape(ref, null, false, lastErr);
 }
 
