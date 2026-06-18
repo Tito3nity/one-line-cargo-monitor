@@ -266,6 +266,74 @@ async function attemptForm(browser, ref) {
 
     const rec = parseFromTables(tables, ref);
     rec.sourceUrl = target.url();
+
+    // ── DETAIL DRILL-DOWN ──────────────────────────────────────────────
+    // The list view (tracking_data_list.xhtml) only carries BL / Onboard /
+    // Voyage / Vessel + a "More detail" link. Container No., type, ports and
+    // ETA live on the DETAIL page (tracking_data_page_by_bl.xhtml) behind that
+    // link. If we don't yet have those, click through and merge them in.
+    // VERIFIED LIVE: the list row's last cell is a "More detail" anchor that
+    // navigates same-tab to tracking_data_page_by_bl.xhtml.
+    const needsDetail = !rec.containerNo || !rec.eta || !rec.destination;
+    if (needsDetail) {
+      try {
+        const navigated = await Promise.all([
+          target.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => null),
+          target.evaluate((refNo) => {
+            // Prefer an explicit "More detail" link; otherwise click the anchor
+            // in the BL's row. Force same-tab so we don't spawn a popup.
+            const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toUpperCase();
+            let link = [...document.querySelectorAll('a')].find(a => /more\s*detail/i.test(a.innerText));
+            if (!link) {
+              // Find the row containing the BL, then its first anchor.
+              for (const tr of document.querySelectorAll('tr')) {
+                if (norm(tr.innerText).includes(refNo.toUpperCase())) {
+                  const a = tr.querySelector('a');
+                  if (a) { link = a; break; }
+                }
+              }
+            }
+            if (link) {
+              link.removeAttribute('target');
+              if (typeof link.onclick === 'function') { link.click(); return true; }
+              // Some links use a JSF onclick handler attribute string.
+              link.click();
+              return true;
+            }
+            return false;
+          }, ref),
+        ]);
+        // navigated[1] (the evaluate result) tells us whether we found a link.
+        const clicked = navigated[1];
+        if (clicked && !ERROR_PAGE_RE.test(target.url())) {
+          await target
+            .waitForFunction(
+              () => /ctnr no|place of receipt|port of discharg|estimated/i.test(document.body.innerText),
+              { timeout: 25000, polling: 500 }
+            )
+            .catch(() => {});
+          if (!ERROR_PAGE_RE.test(target.url())) {
+            const detailTables = await readTables(target);
+            const detail = parseFromTables(detailTables, ref);
+            // Merge: detail fields win where present; keep list-view vessel/voyage.
+            rec.containerNo = rec.containerNo || detail.containerNo;
+            rec.type        = rec.type        || detail.type;
+            rec.origin      = rec.origin      || detail.origin;
+            rec.destination = rec.destination || detail.destination;
+            rec.eta         = rec.eta         || detail.eta;
+            rec.etd         = rec.etd         || detail.etd;
+            if (detail.status && /transit|discharg|arriv|deliver|load|gate|empty|full/i.test(detail.status)) {
+              rec.status = detail.status;
+            }
+            rec.sourceUrl = target.url();
+          }
+        }
+      } catch (e) {
+        // Detail drill-down is best-effort; the list-view record still returns.
+        rec.detailErr = e.message;
+      }
+    }
+
     return rec;
   } finally {
     if (popup) await popup.close().catch(() => {});
