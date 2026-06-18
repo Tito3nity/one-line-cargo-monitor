@@ -277,45 +277,56 @@ async function attemptForm(browser, ref) {
     const needsDetail = !rec.containerNo || !rec.eta || !rec.destination;
     if (needsDetail) {
       try {
-        const navigated = await Promise.all([
-          target.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => null),
-          target.evaluate((refNo) => {
-            // Prefer an explicit "More detail" link; otherwise click the anchor
-            // in the BL's row. Force same-tab so we don't spawn a popup.
-            const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toUpperCase();
-            let link = [...document.querySelectorAll('a')].find(a => /more\s*detail/i.test(a.innerText));
-            if (!link) {
-              // Find the row containing the BL, then its first anchor.
-              for (const tr of document.querySelectorAll('tr')) {
-                if (norm(tr.innerText).includes(refNo.toUpperCase())) {
-                  const a = tr.querySelector('a');
-                  if (a) { link = a; break; }
-                }
+        const beforeUrl = target.url();
+        const clickInfo = await target.evaluate((refNo) => {
+          const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toUpperCase();
+          const info = { anchors: 0, moreDetail: false, rowAnchor: false, href: '', onclickAttr: '' };
+          const allA = [...document.querySelectorAll('a')];
+          info.anchors = allA.length;
+          let link = allA.find(a => /more\s*detail/i.test(a.innerText));
+          if (link) info.moreDetail = true;
+          if (!link) {
+            for (const tr of document.querySelectorAll('tr')) {
+              if (norm(tr.innerText).includes(refNo.toUpperCase())) {
+                const a = tr.querySelector('a');
+                if (a) { link = a; info.rowAnchor = true; break; }
               }
             }
-            if (link) {
-              link.removeAttribute('target');
-              if (typeof link.onclick === 'function') { link.click(); return true; }
-              // Some links use a JSF onclick handler attribute string.
-              link.click();
-              return true;
-            }
-            return false;
-          }, ref),
-        ]);
-        // navigated[1] (the evaluate result) tells us whether we found a link.
-        const clicked = navigated[1];
-        if (clicked && !ERROR_PAGE_RE.test(target.url())) {
+          }
+          if (link) {
+            info.href = link.getAttribute('href') || '';
+            info.onclickAttr = (link.getAttribute('onclick') || '').slice(0, 120);
+            link.removeAttribute('target');
+            link.click();
+            info.clicked = true;
+          } else {
+            info.clicked = false;
+          }
+          return info;
+        }, ref);
+
+        console.log(`[WHL]   detail: anchors=${clickInfo.anchors} moreDetail=${clickInfo.moreDetail} ` +
+                    `rowAnchor=${clickInfo.rowAnchor} clicked=${clickInfo.clicked} href="${clickInfo.href}" ` +
+                    `onclick="${clickInfo.onclickAttr}"`);
+
+        if (clickInfo.clicked) {
+          // Wait for either a same-tab navigation or in-place content swap (JSF ajax).
+          await target.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
           await target
             .waitForFunction(
-              () => /ctnr no|place of receipt|port of discharg|estimated/i.test(document.body.innerText),
-              { timeout: 25000, polling: 500 }
+              () => /ctnr no|place of receipt|port of discharg|estimated|container/i.test(document.body.innerText),
+              { timeout: 20000, polling: 500 }
             )
             .catch(() => {});
-          if (!ERROR_PAGE_RE.test(target.url())) {
+          const afterUrl = target.url();
+          console.log(`[WHL]   detail: navigated ${beforeUrl.split('/').pop()} -> ${afterUrl.split('/').pop()} ` +
+                      `errorPage=${ERROR_PAGE_RE.test(afterUrl)}`);
+
+          if (!ERROR_PAGE_RE.test(afterUrl)) {
             const detailTables = await readTables(target);
             const detail = parseFromTables(detailTables, ref);
-            // Merge: detail fields win where present; keep list-view vessel/voyage.
+            console.log(`[WHL]   detail parsed: ctnr="${detail.containerNo}" type="${detail.type}" ` +
+                        `dest="${detail.destination}" eta="${detail.eta}" tables=${detailTables.length}`);
             rec.containerNo = rec.containerNo || detail.containerNo;
             rec.type        = rec.type        || detail.type;
             rec.origin      = rec.origin      || detail.origin;
@@ -325,12 +336,20 @@ async function attemptForm(browser, ref) {
             if (detail.status && /transit|discharg|arriv|deliver|load|gate|empty|full/i.test(detail.status)) {
               rec.status = detail.status;
             }
-            rec.sourceUrl = target.url();
+            rec.sourceUrl = afterUrl;
+            // Diagnostic breadcrumb that survives shape(): records what the detail
+            // step yielded, so a blank result is explainable from the sheet alone.
+            rec.detailDiag = `det:${detailTables.length}t/ctnr:${detail.containerNo?'y':'n'}/eta:${detail.eta?'y':'n'}`;
+          } else {
+            rec.detailDiag = 'det:errorpage';
           }
+        } else {
+          rec.detailDiag = `det:nolink/a${clickInfo.anchors}`;
         }
       } catch (e) {
-        // Detail drill-down is best-effort; the list-view record still returns.
         rec.detailErr = e.message;
+        rec.detailDiag = 'det:exc:' + (e.message || '').slice(0, 40);
+        console.log(`[WHL]   detail EXC: ${e.message}`);
       }
     }
 
@@ -407,6 +426,7 @@ function shape(ref, r, found, err) {
     const noteBits = [];
     if (r.onboardDate) noteBits.push('Onboard ' + r.onboardDate);
     if (r.voyage)      noteBits.push('Voyage ' + r.voyage);
+    if (r.detailDiag)  noteBits.push(r.detailDiag);
     return {
       found: true,
       blNumber:    r.blNumber || ref,
