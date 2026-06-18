@@ -337,10 +337,60 @@ async function attemptDeepLink(browser, ref) {
     console.log(`[WHL]   deeplink: final=${finalUrl.split('/').pop()} tables=${tblCount} ` +
                 `shell=${/_redirect\.xhtml/i.test(finalUrl)}`);
 
+    // If we're still stuck on the shell, dump its forward logic so we can see
+    // EXACTLY what gates the redirect (it's a small page). Look at inline
+    // scripts mentioning location/submit/forward, any forms + their action, and
+    // body onload — the shell's redirect condition lives in one of these.
+    if (/_redirect\.xhtml/i.test(finalUrl)) {
+      const probe = await page.evaluate(() => {
+        const pick = [];
+        for (const s of document.querySelectorAll('script')) {
+          const t = s.textContent || '';
+          if (/location|submit|forward|window\.open|href|ref_no|setTimeout|onload/i.test(t)) {
+            pick.push(t.replace(/\s+/g, ' ').trim().slice(0, 500));
+          }
+        }
+        const forms = [...document.querySelectorAll('form')].map(f => ({
+          id: f.id, name: f.name, action: f.getAttribute('action') || '',
+          method: f.getAttribute('method') || '',
+          inputs: [...f.querySelectorAll('input')].map(i => `${i.name || i.id}=${(i.value||'').slice(0,30)}`)
+        }));
+        return {
+          bodyOnload: document.body ? (document.body.getAttribute('onload') || '') : '',
+          scripts: pick.slice(0, 4),
+          forms,
+          iframes: [...document.querySelectorAll('iframe')].map(f => f.src || f.id || '(inline)'),
+          tableDump: [...document.querySelectorAll('table')].slice(0, 4).map((tbl, ti) => {
+            const rows = [...tbl.querySelectorAll('tr')].slice(0, 10).map(tr =>
+              [...tr.querySelectorAll('td,th')].map(td => (td.textContent||'').replace(/\s+/g,' ').trim())
+                .filter(Boolean).join(' | ')).filter(Boolean);
+            return `T${ti}: ` + rows.slice(0, 8).join('  /  ').slice(0, 350);
+          }),
+          bodyText: (document.body ? document.body.innerText : '').replace(/\s+/g,' ').slice(0, 200),
+        };
+      }).catch(e => ({ err: e.message }));
+      console.log('[WHL]   SHELLJS: ' + JSON.stringify(probe).slice(0, 1900));
+    }
+
+    // The data may render inside an IFRAME on the shell (common for JSF detail
+    // popups). If so, parse the iframe's document instead of the main frame.
+    let parseTarget = page;
+    for (const fr of page.frames()) {
+      if (fr === page.mainFrame()) continue;
+      const hasData = await fr.evaluate(
+        () => /ctnr no|place of receipt|port of discharg|container|vessel|onboard/i.test(document.body?.innerText || '')
+      ).catch(() => false);
+      if (hasData) {
+        console.log(`[WHL]   deeplink: data found in iframe -> ${(fr.url()||'').split('/').pop()}`);
+        parseTarget = fr;
+        break;
+      }
+    }
+
     if (ERROR_PAGE_RE.test(finalUrl)) throw new Error('deep link bounced to error page');
 
-    const tables = await readTables(page);
-    if (!hasResult(tables, ref)) throw new Error('deep link: no result tables (shell did not forward)');
+    const tables = await readTables(parseTarget);
+    if (!hasResult(tables, ref)) throw new Error('deep link: tables present but no recognizable result rows (see SHELLJS dump)');
 
     const rec = parseFromTables(tables, ref);
     rec.sourceUrl = finalUrl;
