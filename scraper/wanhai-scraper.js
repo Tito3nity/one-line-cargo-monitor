@@ -283,7 +283,7 @@ async function attemptForm(browser, ref) {
           const clean = s => (s || '').replace(/\s+/g, ' ').trim();
           const links = [...document.querySelectorAll('a')].map(a => ({
             id: a.id || '', txt: clean(a.textContent).slice(0, 20),
-            oc: (a.getAttribute('onclick') || '').slice(0, 160),
+            oc: (a.getAttribute('onclick') || '').slice(0, 400),
           })).filter(l => /autoLink_|formblSubmit|formbookingSubmit|B\/?L\s*Data|Booking\s*Data/i.test(l.id + l.txt + l.oc));
           const form = document.getElementById('cargoTrackV2Bean') || document.querySelector('form');
           return { links: links.slice(0, 8), hasForm: !!form,
@@ -291,24 +291,45 @@ async function attemptForm(browser, ref) {
         }).catch(e => ({ err: e.message }));
         console.log('[WHL]   DETAILLINKS: ' + JSON.stringify(probe).slice(0, 800));
 
-        // Fire the B/L Data postback in-frame. Force target=_self FIRST, then
-        // run the link's own onclick (jsf.util.chain + mojarra.jsfcljs) so JSF
-        // submits cargoTrackV2Bean to this same frame.
+        // Fire the B/L Data postback in-frame via NATIVE form submit. mojarra's
+        // jsfcljs() just (1) adds a hidden input named after the command link's
+        // source id, (2) sets target, (3) submits the form. A synthetic onclick
+        // runs jsfcljs but the submit doesn't navigate in headless — so we do
+        // mojarra's job ourselves: parse the source param from the onclick and
+        // submit cargoTrackV2Bean natively (which always navigates).
         const fired = await target.evaluate(() => {
           const form = document.getElementById('cargoTrackV2Bean') || document.querySelector('form');
-          if (form) { form.setAttribute('target', '_self'); form.target = '_self'; }
-          // Prefer the B/L Data link; fall back to an autoLink_ or Booking Data.
-          const pick = re => [...document.querySelectorAll('a')]
-            .find(a => re.test((a.getAttribute('onclick') || '') + ' ' + (a.textContent || '') + ' ' + (a.id || '')));
-          const a = pick(/formblSubmit|B\/?L\s*Data/i) || pick(/autoLink_/i) || pick(/formbookingSubmit|Booking\s*Data/i);
-          if (!a) return { ok: false, reason: 'no detail link on list page' };
-          a.removeAttribute('target');
-          // Run the onclick code directly (it contains the mojarra submit), then
-          // also dispatch a native click as a belt-and-braces trigger.
-          const oc = a.getAttribute('onclick');
-          try { if (oc) { new Function('event', oc).call(a, new MouseEvent('click', { bubbles: true })); } } catch (e) {}
-          a.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-          return { ok: true, used: a.id || a.textContent.trim().slice(0, 20) };
+          if (!form) return { ok: false, reason: 'no form' };
+          const a = [...document.querySelectorAll('a')]
+            .find(x => /formblSubmit|B\/?L\s*Data/i.test((x.getAttribute('onclick') || '') + ' ' + (x.textContent || '')));
+          if (!a) return { ok: false, reason: 'no B/L Data link' };
+          const oc = a.getAttribute('onclick') || '';
+
+          // Extract the mojarra source param: jsfcljs(form, {'SRC':'SRC'}, '') or
+          // jsfcljs(form, 'SRC', ''). Grab the JSF client id (e.g. j_idt29:0:j_id..).
+          let src = '';
+          let m = oc.match(/jsfcljs\([^,]+,\s*\{?\s*'([^']+)'/);
+          if (m) src = m[1];
+          if (!src) { m = oc.match(/'(j_idt\d+:[^']+)'/); if (m) src = m[1]; }
+
+          form.setAttribute('target', '_self');
+          form.target = '_self';
+
+          // Add the hidden source input mojarra would add, then native-submit.
+          if (src) {
+            let inp = form.querySelector(`input[name="${src.replace(/"/g, '\\"')}"]`);
+            if (!inp) {
+              inp = document.createElement('input');
+              inp.type = 'hidden'; inp.name = src; inp.value = src;
+              form.appendChild(inp);
+            }
+          }
+          try {
+            if (form.requestSubmit) form.requestSubmit(); else form.submit();
+            return { ok: true, src, action: form.getAttribute('action') || '' };
+          } catch (e) {
+            return { ok: false, reason: 'submit threw: ' + String(e).slice(0, 80), src };
+          }
         }).catch(e => ({ ok: false, reason: e.message }));
         console.log('[WHL]   DETAILFIRE: ' + JSON.stringify(fired).slice(0, 300));
 
