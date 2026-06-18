@@ -2,9 +2,13 @@ name: Wan Hai Daily Cargo Tracker
 
 on:
   schedule:
-    # Same cadence as the ONE Line tracker (01:00 UTC = 08:00 WIB), offset by
-    # 10 minutes so the two scrapers don't write to the sheet simultaneously.
-    - cron: '10 1 * * *'
+    # "Always fresh" cadence: every 3 hours, offset to :10 so it never collides
+    # with the ONE Line tracker's top-of-hour run. 8 runs/day keeps the BL
+    # current without hammering Wan Hai or burning Actions minutes.
+    # (00:10, 03:10, 06:10, 09:10, 12:10, 15:10, 18:10, 21:10 UTC)
+    - cron: '10 */3 * * *'
+  # workflow_dispatch lets the dashboard's "Refresh Wan Hai" button trigger an
+  # on-demand scrape via the GitHub REST API (see index.html dispatchWanhai()).
   workflow_dispatch:
 
 jobs:
