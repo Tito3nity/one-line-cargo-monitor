@@ -311,166 +311,76 @@ async function attemptForm(browser, ref) {
     if (needsDetail) {
       try {
         const beforeUrl = target.url();
-        // Fingerprint current content so we can detect an in-place (ajax) change.
-        const beforeFp = await target.evaluate(() =>
-          (document.body.innerText || '').replace(/\s+/g, ' ').length);
 
-        const clickInfo = await target.evaluate((refNo) => {
-          const info = { anchors: 0, strategy: '', clicked: false, targetedForm: false,
-                         fnSrc: '', hiddenBefore: [], submitted: false };
-          const allA = [...document.querySelectorAll('a')];
-          info.anchors = allA.length;
-
-          const form = document.getElementById('cargoTrackV2Bean') || document.querySelector('form');
-          if (form) { form.setAttribute('target', '_self'); form.target = '_self'; info.targetedForm = true; }
-
-          // Capture formblSubmit's source so we can see which hidden fields it
-          // sets (the LISTPROBE proved this is a JSF form POST, not a GET).
-          if (typeof window.formblSubmit === 'function') {
-            info.fnSrc = String(window.formblSubmit).replace(/\s+/g, ' ').slice(0, 400);
-          }
-          // Snapshot hidden inputs before, to compare what the fn changes.
-          if (form) {
-            info.hiddenBefore = [...form.querySelectorAll('input[type=hidden],input:not([type])')]
-              .map(i => `${i.name || i.id}=${(i.value || '').slice(0, 24)}`).slice(0, 20);
-          }
-
-          // STRATEGY: call formblSubmit directly (it sets the hidden fields),
-          // THEN submit the form natively. Native submit() always navigates and
-          // doesn't depend on a trusted event — unlike the dispatched click,
-          // which fired jsf.util.chain but mojarra's programmatic submit didn't
-          // navigate. We let formblSubmit populate the params, then force the POST.
+        // formblSubmit(ref,'MFT') does ONE thing (confirmed from its source):
+        //   window.open('/views/cargo_track_v2/tracking_data_page_by_bl_redirect.xhtml?ref_no=..&ref_type=MFT','_blank')
+        // i.e. it opens the BL detail in a popup. We register a popup listener,
+        // call the fn, then wait on that popup for the redirect shell to forward
+        // to the rendered detail page. ref_type MUST be 'MFT' for B/L data.
+        let detailPopup = null;
+        const onTarget = async (t) => {
           try {
-            if (typeof window.formblSubmit === 'function') {
-              info.strategy = 'fnThenSubmit';
-              // formblSubmit may itself submit; if it doesn't navigate we follow up.
-              window.formblSubmit(refNo, 'MFT');
-              info.clicked = true;
+            if (t.type && t.type() === 'page') {
+              const p = await t.page();
+              if (p) detailPopup = p;
             }
-          } catch (e) { info.fnErr = String(e).slice(0, 80); }
+          } catch (_) {}
+        };
+        browser.on('targetcreated', onTarget);
 
-          // If the fn didn't exist, fall back to clicking the B/L Data anchor.
-          if (!info.clicked) {
-            const link = allA.find(a => /formblSubmit\s*\(|B\/?L\s*Data/i.test((a.getAttribute('onclick')||'') + ' ' + (a.innerText||'')));
-            if (link) {
-              info.strategy = 'blDataClick';
-              link.removeAttribute('target');
-              link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-              info.clicked = true;
-            }
+        const fnInfo = await target.evaluate((refNo) => {
+          const out = { called: false, fnSrc: '' };
+          if (typeof window.formblSubmit === 'function') {
+            out.fnSrc = String(window.formblSubmit).replace(/\s+/g, ' ').slice(0, 200);
+            try { window.formblSubmit(refNo, 'MFT'); out.called = true; } catch (e) { out.err = String(e).slice(0,80); }
+          } else {
+            // Fallback: click the B/L Data anchor (its onclick calls the fn).
+            const a = [...document.querySelectorAll('a')]
+              .find(x => /formblSubmit|B\/?L\s*Data/i.test((x.getAttribute('onclick')||'')+' '+(x.innerText||'')));
+            if (a) { a.removeAttribute('target');
+              a.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window})); out.called = true; }
           }
-          return info;
-        }, ref);
+          return out;
+        }, ref).catch(e => ({ called:false, err:e.message }));
+        console.log(`[WHL]   detail: formblSubmit called=${fnInfo.called} err="${fnInfo.err||''}"`);
 
-        console.log(`[WHL]   detail: strategy=${clickInfo.strategy} targetedForm=${clickInfo.targetedForm} ` +
-                    `clicked=${clickInfo.clicked} fnErr="${clickInfo.fnErr||''}"`);
-        console.log(`[WHL]   detail: fnSrc="${clickInfo.fnSrc}"`);
-        console.log(`[WHL]   detail: hiddenBefore=${JSON.stringify(clickInfo.hiddenBefore).slice(0,400)}`);
+        // Wait up to ~6s for the popup to be created by window.open.
+        for (let i = 0; i < 24 && !detailPopup; i++) await new Promise(r => setTimeout(r, 250));
+        browser.off('targetcreated', onTarget);
 
-        // Wait for the POST navigation. If formblSubmit set fields but didn't
-        // submit, force a native submit now and wait again.
-        let nav = await target.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => null);
-        if (!nav) {
-          const forced = await target.evaluate(() => {
-            const f = document.getElementById('cargoTrackV2Bean') || document.querySelector('form');
-            if (f) { f.target = '_self'; (f.requestSubmit ? f.requestSubmit() : f.submit()); return true; }
-            return false;
-          }).catch(() => false);
-          console.log(`[WHL]   detail: forcedNativeSubmit=${forced}`);
-          if (forced) {
-            await target.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+        if (detailPopup) {
+          popup2 = detailPopup;
+          await popup2.bringToFront().catch(() => {});
+          console.log(`[WHL]   detail: popup -> ${popup2.url().split('/').pop()}`);
+
+          // Wait for the redirect shell to forward off *_redirect.xhtml AND for
+          // real content to render. The shell uses a client-side forward, so it
+          // needs a moment; give it a generous budget.
+          await popup2.waitForFunction(
+            () => !/_redirect\.xhtml/i.test(location.href) &&
+                  document.querySelectorAll('table').length > 0,
+            { timeout: 25000, polling: 400 }
+          ).catch(() => {});
+
+          // If it's still stuck on the shell, reload it ONCE in this same popup
+          // (which now holds the forwarded session) to nudge the forward.
+          if (/_redirect\.xhtml/i.test(popup2.url())) {
+            console.log('[WHL]   detail: shell stalled, reloading popup once');
+            await popup2.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+            await popup2.waitForFunction(
+              () => document.querySelectorAll('table').length > 0 &&
+                    /ctnr|vessel|discharg|receipt|estimated|laden/i.test(document.body.innerText||''),
+              { timeout: 20000, polling: 500 }
+            ).catch(() => {});
           }
+          await new Promise(r => setTimeout(r, 2000));
+          console.log(`[WHL]   detail: popup settled -> ${popup2.url().split('/').pop()}`);
+          target = popup2;
+        } else {
+          console.log('[WHL]   detail: no popup opened');
         }
 
-        if (clickInfo.clicked) {
-          // The jsfcljs postback may either (a) swap content in place at the
-          // same URL, or (b) open the detail in a NEW popup tab. Handle both.
-          const pagesBefore = new Set(await browser.pages());
-          // Wait for in-place content change OR a popup to appear.
-          await target
-            .waitForFunction(
-              (prevLen) => {
-                const t = (document.body.innerText || '');
-                const hasDetail = /ctnr no|place of receipt|port of discharg|estimated|laden|container no/i.test(t);
-                const changed = Math.abs(t.replace(/\s+/g, ' ').length - prevLen) > 40;
-                return hasDetail || changed;
-              },
-              { timeout: 12000, polling: 500 },
-              beforeFp
-            )
-            .catch(() => {});
-
-          // Check for a popup result tab opened by the postback. Match the
-          // booking/BL detail pages AND their _redirect.xhtml shells (the
-          // postback opens tracking_data_page_by_booking_redirect.xhtml, which
-          // then forwards to the real detail page). VERIFIED FROM LIVE LOG.
-          for (const p of await browser.pages()) {
-            if (pagesBefore.has(p)) continue;
-            const u = p.url();
-            if (/tracking_data_page_by_(bl|booking)(_redirect)?\.xhtml|tracking_data_list\.xhtml|cargo_track/i.test(u)) {
-              popup2 = p; break;
-            }
-          }
-          if (popup2) {
-            console.log(`[WHL]   detail: popup opened -> ${popup2.url().split('/').pop()}`);
-            await popup2.bringToFront().catch(() => {});
-
-            // The *_redirect.xhtml page is a shell that should forward to the
-            // real detail page. Wait for it to leave the shell...
-            await popup2.waitForFunction(
-              () => !/_redirect\.xhtml/i.test(location.href),
-              { timeout: 12000, polling: 400 }
-            ).catch(() => {});
-
-            // LIVE-OBSERVED: the redirect shell sometimes never forwards and
-            // stays blank (tables:0) — it was opened as a cold GET without the
-            // POST/session context it needs. When that happens, drive the popup
-            // ourselves to the NON-redirect detail page, reusing the booking
-            // params from the shell URL. The popup shares the browser's session
-            // cookies, so the direct page resolves. Try by_booking then by_bl.
-            let stillShell = /_redirect\.xhtml/i.test(popup2.url());
-            let blank = await popup2.evaluate(
-              () => document.querySelectorAll('table').length === 0
-            ).catch(() => true);
-            if (stillShell || blank) {
-              const su = popup2.url();
-              const refNo  = (su.match(/[?&]ref_no=([^&]+)/i)  || [])[1] || encodeURIComponent(ref);
-              const refTyp = (su.match(/[?&]ref_type=([^&]+)/i) || [])[1] || 'BKG';
-              const directBase = 'https://www.wanhai.com/views/cargo_track_v2/';
-              const candidates = [
-                directBase + 'tracking_data_page_by_booking.xhtml?ref_no=' + refNo + '&ref_type=' + refTyp,
-                directBase + 'tracking_data_page_by_bl.xhtml?ref_no=' + refNo + '&ref_type=' + refTyp,
-              ];
-              for (const cand of candidates) {
-                console.log(`[WHL]   detail: shell blank, trying direct -> ${cand.split('/').pop()}`);
-                await popup2.goto(cand, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-                if (ERROR_PAGE_RE.test(popup2.url())) continue;
-                await popup2.waitForFunction(
-                  () => document.querySelectorAll('table').length > 0 &&
-                        /ctnr no|place of receipt|port of discharg|estimated|laden|container|vessel/i.test(document.body.innerText || ''),
-                  { timeout: 18000, polling: 500 }
-                ).catch(() => {});
-                const ok = await popup2.evaluate(
-                  () => document.querySelectorAll('table').length > 0
-                ).catch(() => false);
-                if (ok) break;
-              }
-            } else {
-              // Shell forwarded normally — just wait for content to render.
-              await popup2.waitForFunction(
-                () => document.querySelectorAll('table').length > 0 &&
-                      /ctnr no|place of receipt|port of discharg|estimated|laden|container|vessel/i.test(document.body.innerText || ''),
-                { timeout: 20000, polling: 500 }
-              ).catch(() => {});
-            }
-            await new Promise(r => setTimeout(r, 1500));
-            console.log(`[WHL]   detail: popup settled -> ${popup2.url().split('/').pop()}`);
-            target = popup2;   // parse the popup from here on
-          } else {
-            // No popup: give an in-place ajax repaint a moment to settle.
-            await new Promise(r => setTimeout(r, 1500));
-          }
-
+        {
           const afterUrl = target.url();
           console.log(`[WHL]   detail: ${beforeUrl.split('/').pop()} -> ${afterUrl.split('/').pop()} ` +
                       `errorPage=${ERROR_PAGE_RE.test(afterUrl)}`);
@@ -516,8 +426,6 @@ async function attemptForm(browser, ref) {
           } else {
             rec.detailDiag = 'det:errorpage';
           }
-        } else {
-          rec.detailDiag = `det:nolink/a${clickInfo.anchors}`;
         }
       } catch (e) {
         rec.detailErr = e.message;
