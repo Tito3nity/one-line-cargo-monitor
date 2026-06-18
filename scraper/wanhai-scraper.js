@@ -278,55 +278,79 @@ async function attemptForm(browser, ref) {
     if (needsDetail) {
       try {
         const beforeUrl = target.url();
+        // Fingerprint current content so we can detect an in-place (ajax) change.
+        const beforeFp = await target.evaluate(() =>
+          (document.body.innerText || '').replace(/\s+/g, ' ').length);
+
         const clickInfo = await target.evaluate((refNo) => {
           const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toUpperCase();
-          const info = { anchors: 0, moreDetail: false, rowAnchor: false, href: '', onclickAttr: '' };
+          const info = { anchors: 0, strategy: '', href: '', onclickAttr: '', clicked: false };
           const allA = [...document.querySelectorAll('a')];
           info.anchors = allA.length;
-          let link = allA.find(a => /more\s*detail/i.test(a.innerText));
-          if (link) info.moreDetail = true;
+
+          // PRIMARY: the detail trigger is a JSF anchor whose onclick calls
+          // formbookingSubmit('<BL>', 'BKG'|'MFT'). VERIFIED FROM LIVE LOG.
+          // Click THAT element directly so the JSF/mojarra handler fires its
+          // ajax postback (it updates the page in place — same URL).
+          let link = allA.find(a => /formbookingSubmit\s*\(/i.test(a.getAttribute('onclick') || ''));
+          if (link) info.strategy = 'formbookingSubmit';
+
+          // FALLBACK 1: explicit "More detail" text.
+          if (!link) {
+            link = allA.find(a => /more\s*detail/i.test(a.innerText));
+            if (link) info.strategy = 'moreDetailText';
+          }
+          // FALLBACK 2: first anchor in the BL's row (last resort).
           if (!link) {
             for (const tr of document.querySelectorAll('tr')) {
               if (norm(tr.innerText).includes(refNo.toUpperCase())) {
                 const a = tr.querySelector('a');
-                if (a) { link = a; info.rowAnchor = true; break; }
+                if (a) { link = a; info.strategy = 'rowAnchor'; break; }
               }
             }
           }
+
           if (link) {
             info.href = link.getAttribute('href') || '';
-            info.onclickAttr = (link.getAttribute('onclick') || '').slice(0, 120);
+            info.onclickAttr = (link.getAttribute('onclick') || '').slice(0, 140);
             link.removeAttribute('target');
+            // Fire the native click so JSF's registered handler runs (calling
+            // .onclick() directly can skip mojarra's event chain).
             link.click();
             info.clicked = true;
-          } else {
-            info.clicked = false;
           }
           return info;
         }, ref);
 
-        console.log(`[WHL]   detail: anchors=${clickInfo.anchors} moreDetail=${clickInfo.moreDetail} ` +
-                    `rowAnchor=${clickInfo.rowAnchor} clicked=${clickInfo.clicked} href="${clickInfo.href}" ` +
-                    `onclick="${clickInfo.onclickAttr}"`);
+        console.log(`[WHL]   detail: anchors=${clickInfo.anchors} strategy=${clickInfo.strategy} ` +
+                    `clicked=${clickInfo.clicked} href="${clickInfo.href}" onclick="${clickInfo.onclickAttr}"`);
 
         if (clickInfo.clicked) {
-          // Wait for either a same-tab navigation or in-place content swap (JSF ajax).
-          await target.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+          // This is a JSF ajax postback: the URL stays the same and the DOM is
+          // swapped in place. So DON'T wait for navigation — wait for the
+          // container/ETA content to APPEAR (or the body text to change size).
           await target
             .waitForFunction(
-              () => /ctnr no|place of receipt|port of discharg|estimated|container/i.test(document.body.innerText),
-              { timeout: 20000, polling: 500 }
+              (prevLen) => {
+                const t = (document.body.innerText || '');
+                const hasDetail = /ctnr no|place of receipt|port of discharg|estimated|laden|container no/i.test(t);
+                const changed = Math.abs(t.replace(/\s+/g, ' ').length - prevLen) > 40;
+                return hasDetail || changed;
+              },
+              { timeout: 25000, polling: 500 },
+              beforeFp
             )
             .catch(() => {});
+          // Give a JSF ajax repaint a moment to settle.
+          await new Promise(r => setTimeout(r, 1500));
+
           const afterUrl = target.url();
-          console.log(`[WHL]   detail: navigated ${beforeUrl.split('/').pop()} -> ${afterUrl.split('/').pop()} ` +
+          console.log(`[WHL]   detail: ${beforeUrl.split('/').pop()} -> ${afterUrl.split('/').pop()} ` +
                       `errorPage=${ERROR_PAGE_RE.test(afterUrl)}`);
 
           if (!ERROR_PAGE_RE.test(afterUrl)) {
-            // ── STRUCTURAL PROBE (temporary): log how the detail page is really
-            // laid out, so we stop guessing. Logs table count, key element
-            // counts, any "container"-ish text context, and a labelled-value
-            // sample. Safe to remove once the parser is confirmed.
+            // ── STRUCTURAL PROBE (temporary): log how the detail content is laid
+            // out so the parser can be fixed exactly. Safe to remove later.
             const probe = await target.evaluate(() => {
               const out = { tables: 0, divs: 0, uls: 0, dls: 0, ctnrCtx: [], labels: [] };
               out.tables = document.querySelectorAll('table').length;
@@ -334,12 +358,10 @@ async function attemptForm(browser, ref) {
               out.uls    = document.querySelectorAll('ul').length;
               out.dls    = document.querySelectorAll('dl').length;
               const body = document.body.innerText || '';
-              // Capture ~80 chars around each occurrence of container-ish words.
-              for (const kw of ['Ctnr', 'Container', 'Estimated', 'Arrival', 'Discharge', 'Receipt']) {
+              for (const kw of ['Ctnr', 'Container', 'Estimated', 'Arrival', 'Discharge', 'Receipt', 'Laden', 'WHSU']) {
                 const i = body.indexOf(kw);
                 if (i >= 0) out.ctnrCtx.push(kw + ':«' + body.slice(i, i + 80).replace(/\s+/g, ' ') + '»');
               }
-              // Any element whose className/id hints at the container panel.
               const hint = [...document.querySelectorAll('[id*="ctnr"],[id*="container"],[class*="ctnr"],[class*="container"]')]
                 .slice(0, 5).map(e => (e.tagName + '#' + (e.id || '') + '.' + (e.className || '')).slice(0, 60));
               out.hintEls = hint;
