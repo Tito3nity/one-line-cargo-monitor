@@ -305,12 +305,14 @@ async function attemptForm(browser, ref) {
           if (!a) return { ok: false, reason: 'no B/L Data link' };
           const oc = a.getAttribute('onclick') || '';
 
-          // Extract the mojarra source param: jsfcljs(form, {'SRC':'SRC'}, '') or
-          // jsfcljs(form, 'SRC', ''). Grab the JSF client id (e.g. j_idt29:0:j_id..).
+          // Extract the mojarra source param. The onclick contains
+          // mojarra.jsfcljs(form, {'j_idt29:0:j_idtNN':'...'}, '') — grab the
+          // JSF client id. Strip any backslash escaping the browser kept.
           let src = '';
-          let m = oc.match(/jsfcljs\([^,]+,\s*\{?\s*'([^']+)'/);
+          let m = oc.match(/(j_idt\d+:\d+:j_idt\d+)/);   // the exact B/L Data command id
           if (m) src = m[1];
-          if (!src) { m = oc.match(/'(j_idt\d+:[^']+)'/); if (m) src = m[1]; }
+          if (!src) { m = oc.match(/\{\s*\\?'([^'\\]+)/); if (m) src = m[1]; }
+          src = src.replace(/\\+/g, '');   // defensive de-escape
 
           form.setAttribute('target', '_self');
           form.target = '_self';
