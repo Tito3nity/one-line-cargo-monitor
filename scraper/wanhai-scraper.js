@@ -639,17 +639,20 @@ async function scrapeWanHai(browser, bl) {
   const ref = String(bl).trim().toUpperCase();
 
   // ── PRIMARY: extract everything from Wan Hai's own page ────────────────────
-  // Two complementary page paths, merged for the most complete record:
-  //   • attemptForm     — reliably yields the list view (vessel/voyage/status).
-  //   • attemptDeepLink — navigates the MAIN frame to the redirect URL and lets
-  //     the shell's JS forward fire (opener/referer intact), reaching the full
-  //     detail page (container No / type / ports / ETA).
-  // We run both (deep link first, since it carries the detail fields) and merge.
+  // Two page paths:
+  //   • attemptForm     — THE reliable path. Loads the search form, submits the
+  //     BL, then dispatches the "B/L Data" link's real onclick so jsf.util.chain
+  //     runs formblSubmit + the mojarra postback in order, reaching the full
+  //     detail page (container No / type / ports / ETA). Run-verified.
+  //   • attemptDeepLink — legacy fallback. The redirect shell's autoLink_ nodes
+  //     don't render headless on the current site version, so it usually adds
+  //     nothing; kept as a single cheap attempt in case Wan Hai reverts.
+  // Run form first; only fall back to the deep link if detail fields are missing.
   let merged = null;
   let lastErr = '';
 
-  const runAttempt = async (fn, label) => {
-    for (let tries = 0; tries < 2; tries++) {
+  const runAttempt = async (fn, label, maxTries = 2) => {
+    for (let tries = 0; tries < maxTries; tries++) {
       try {
         const r = await fn(browser, ref);
         if (r && (r.vessel || r.voyage || r.containerNo || r.eta)) return r;
@@ -658,27 +661,28 @@ async function scrapeWanHai(browser, bl) {
         lastErr = label + ': ' + e.message;
         console.log(`[WHL]   ${label} failed: ${e.message}`);
       }
-      await new Promise((res) => setTimeout(res, 1500));
+      if (tries < maxTries - 1) await new Promise((res) => setTimeout(res, 1500));
     }
     return null;
   };
 
-  // Deep link first — it's the one that can reach container/ETA.
-  const deep = await runAttempt(attemptDeepLink, 'deeplink');
-  if (deep) merged = { ...deep };
+  // FORM FLOW FIRST. Proven (run-verified for 030G526931) to reach the full
+  // B/L detail page — container, type, ports, ETA — by dispatching the B/L Data
+  // link's real onclick so jsf.util.chain runs formblSubmit + the mojarra
+  // postback in order. This is the reliable path, so we lead with it.
+  const form = await runAttempt(attemptForm, 'form');
+  if (form) merged = { ...form };
 
-  // Run the form flow if we still lack the list-view basics or detail fields.
-  const needBasics = !merged || !merged.vessel || !merged.voyage;
-  if (needBasics) {
-    const form = await runAttempt(attemptForm, 'form');
-    if (form) {
-      // Merge: keep any field already populated; fill blanks from the other path.
-      merged = {
-        ...(form || {}),
-        ...Object.fromEntries(Object.entries(merged || {}).filter(([, v]) => v)),
-      };
-      // Ensure detail fields from deep link aren't lost if form had blanks.
-      if (deep) for (const k of ['containerNo', 'type', 'origin', 'destination', 'eta', 'etd']) {
+  // DEEP LINK only as a fallback, and only if the form flow missed the detail
+  // fields. On this site version the redirect shell's autoLink_ elements don't
+  // render headless (AUTOFWD: autoLinks:[]), so this rarely adds anything — but
+  // it's a cheap single attempt and may help if Wan Hai changes the shell back.
+  const needDetail = !merged || !merged.containerNo || !merged.eta || !merged.destination;
+  if (needDetail) {
+    const deep = await runAttempt(attemptDeepLink, 'deeplink', 1);
+    if (deep) {
+      if (!merged) merged = { ...deep };
+      else for (const k of ['containerNo', 'type', 'origin', 'destination', 'eta', 'etd', 'vessel', 'voyage']) {
         if (!merged[k] && deep[k]) merged[k] = deep[k];
       }
     }
