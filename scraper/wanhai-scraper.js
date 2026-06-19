@@ -304,46 +304,47 @@ async function attemptForm(browser, ref) {
         }).catch(e => ({ err: e.message }));
         console.log('[WHL]   DETAILLINKS: ' + JSON.stringify(probe).slice(0, 800));
 
-        // Fire the B/L Data postback in-frame via NATIVE form submit. mojarra's
-        // jsfcljs() just (1) adds a hidden input named after the command link's
-        // source id, (2) sets target, (3) submits the form. A synthetic onclick
-        // runs jsfcljs but the submit doesn't navigate in headless — so we do
-        // mojarra's job ourselves: parse the source param from the onclick and
-        // submit cargoTrackV2Bean natively (which always navigates).
+        // Fire the B/L Data link the SAME WAY THE PAGE DOES. The log proved the
+        // onclick is jsf.util.chain(this, event, 'formblSubmit(BL,MFT)', 'mojarra
+        // .jsfcljs(...)'): formblSubmit MUST run first — it arms the parameters
+        // the detail page reads — THEN jsfcljs posts. The old code reimplemented
+        // only the jsfcljs half via native form.submit(), which skipped
+        // formblSubmit and just re-posted the LIST page back to itself (verified:
+        // we landed on tracking_data_list.xhtml showing the same list). So now we
+        // force target=_self (so the post navigates in-tab instead of opening a
+        // popup we can't render) and dispatch the anchor's REAL click, letting
+        // jsf.util.chain execute formblSubmit + the postback in the right order.
+        const pagesPreClick = new Set(await browser.pages());
         const fired = await target.evaluate(() => {
           const form = document.getElementById('cargoTrackV2Bean') || document.querySelector('form');
-          if (!form) return { ok: false, reason: 'no form' };
-          const a = [...document.querySelectorAll('a')]
-            .find(x => /formblSubmit|B\/?L\s*Data/i.test((x.getAttribute('onclick') || '') + ' ' + (x.textContent || '')));
+          if (form) { form.setAttribute('target', '_self'); form.target = '_self'; }
+
+          // Find the "B/L Data" command link specifically (not Booking Data).
+          const a = [...document.querySelectorAll('a')].find(x => {
+            const t = (x.textContent || '').replace(/\s+/g, ' ').trim();
+            const oc = x.getAttribute('onclick') || '';
+            return /formblSubmit/.test(oc) || /^B\/?L\s*Data$/i.test(t);
+          });
           if (!a) return { ok: false, reason: 'no B/L Data link' };
+
+          // Neutralize window.open so any target=_blank inside the chain can't
+          // spawn an unrenderable popup — redirect it to same-tab navigation.
+          window.open = (u) => { if (u) location.href = u; return window; };
+
           const oc = a.getAttribute('onclick') || '';
+          let m = oc.match(/(j_idt\d+:\d+:j_idt\d+)/);
+          const src = m ? m[1] : '';
 
-          // Extract the mojarra source param. The onclick contains
-          // mojarra.jsfcljs(form, {'j_idt29:0:j_idtNN':'...'}, '') — grab the
-          // JSF client id. Strip any backslash escaping the browser kept.
-          let src = '';
-          let m = oc.match(/(j_idt\d+:\d+:j_idt\d+)/);   // the exact B/L Data command id
-          if (m) src = m[1];
-          if (!src) { m = oc.match(/\{\s*\\?'([^'\\]+)/); if (m) src = m[1]; }
-          src = src.replace(/\\+/g, '');   // defensive de-escape
-
-          form.setAttribute('target', '_self');
-          form.target = '_self';
-
-          // Add the hidden source input mojarra would add, then native-submit.
-          if (src) {
-            let inp = form.querySelector(`input[name="${src.replace(/"/g, '\\"')}"]`);
-            if (!inp) {
-              inp = document.createElement('input');
-              inp.type = 'hidden'; inp.name = src; inp.value = src;
-              form.appendChild(inp);
-            }
-          }
+          // Dispatch the anchor's own click so jsf.util.chain runs in full.
           try {
-            if (form.requestSubmit) form.requestSubmit(); else form.submit();
-            return { ok: true, src, action: form.getAttribute('action') || '' };
+            a.removeAttribute('target');
+            const ev = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+            a.dispatchEvent(ev);
+            return { ok: true, src, action: form ? (form.getAttribute('action') || '') : '', via: 'anchor-click' };
           } catch (e) {
-            return { ok: false, reason: 'submit threw: ' + String(e).slice(0, 80), src };
+            // Fallback: if click is intercepted, invoke the inline handler directly.
+            try { if (typeof a.onclick === 'function') a.onclick(ev); return { ok: true, src, via: 'onclick-fn' }; }
+            catch (e2) { return { ok: false, reason: 'click threw: ' + String(e).slice(0, 80), src }; }
           }
         }).catch(e => ({ ok: false, reason: e.message }));
         console.log('[WHL]   DETAILFIRE: ' + JSON.stringify(fired).slice(0, 300));
@@ -351,6 +352,28 @@ async function attemptForm(browser, ref) {
         console.log('[WHL]   NETLOG(last 8): ' + JSON.stringify(netLog.slice(-8)));
 
         if (fired.ok) {
+          // The chain's postback may (a) navigate THIS tab, or (b) open a new
+          // tab despite our window.open override. Capture either. First, see if
+          // a new result tab appeared.
+          const pagesBefore = pagesPreClick;
+          for (let i = 0; i < 16; i++) {
+            await new Promise(r => setTimeout(r, 500));
+            let found = false;
+            for (const p of await browser.pages()) {
+              if (pagesBefore.has(p) || p === target) continue;
+              const u = p.url();
+              if (/tracking_data/i.test(u)) {
+                popup2 = p; await p.bringToFront().catch(() => {});
+                console.log('[WHL]   detail postback opened popup -> ' + u.split('/').pop());
+                target = p; found = true; break;
+              }
+            }
+            if (found) break;
+            // Or this tab itself moved off the list onto a detail view.
+            if (/place of receipt|port of discharg|ctnr no|container no/i
+                  .test(await target.evaluate(() => document.body?.innerText || '').catch(() => ''))) break;
+          }
+
           // Wait for the in-frame navigation OR in-place content swap to detail.
           await target.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {});
           await target.waitForFunction(
