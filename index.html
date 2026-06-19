@@ -919,6 +919,16 @@ async function refreshAllLocal() {
 // ============================================================
 function syncToSheets(record) {
   if (!SHEETS_URL) return;
+  // Resolve the carrier defensively. A Wan Hai BL must NEVER be written as ONE:
+  // if it were, the Apps Script scheduled ONE-Line refresh would re-fetch it,
+  // get nothing, and blank the row back to Pending — and the Wan Hai scraper
+  // (which only scans carrier==WANHAI rows) would never find it again. So we
+  // treat the row as WANHAI if it is tagged WANHAI OR its track URL is a Wan Hai
+  // URL, and only fall back to ONE when neither signal is present.
+  const isWanhai =
+    String(record.carrier || '').toUpperCase() === 'WANHAI' ||
+    /wanhai\.com/i.test(record.trackUrl || '');
+  const carrier = isWanhai ? 'WANHAI' : (record.carrier || 'ONE').toUpperCase();
   // v2: use writerecord to pass all fields directly — no re-fetch needed
   const params = new URLSearchParams({
     action      : 'writerecord',
@@ -934,7 +944,7 @@ function syncToSheets(record) {
     status      : record.status      || '',
     notes       : record.notes       || '',
     trackUrl    : record.trackUrl    || '',
-    carrier     : record.carrier     || 'ONE'
+    carrier     : carrier
   });
   fetch(`${SHEETS_URL}?${params}`, { mode:'no-cors' }).catch(()=>{});
 }
