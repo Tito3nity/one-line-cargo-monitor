@@ -190,6 +190,19 @@ async function attemptForm(browser, ref) {
   await page.setUserAgent(UA);
   let popup = null;
   let popup2 = null;   // detail-page popup opened by the formbookingSubmit postback
+
+  // DIAGNOSTIC: log every response to a tracking_data / mojarra endpoint so we
+  // can see whether the detail postback actually hits the server and what it
+  // returns (200 + text/html that navigates, vs a JSF partial-response XML that
+  // never navigates headless). This is the network-level evidence the prior
+  // run cycles lacked.
+  const netLog = [];
+  page.on('response', (resp) => {
+    const u = resp.url();
+    if (/tracking_data|cargo_track|jakarta\.faces|javax\.faces|\.xhtml/i.test(u)) {
+      netLog.push(`${resp.status()} ${(resp.headers()['content-type'] || '').split(';')[0]} ${u.split('/').pop().slice(0, 60)}`);
+    }
+  });
   try {
     await page.goto(FORM_PAGE, { waitUntil: 'domcontentloaded' });
 
@@ -334,6 +347,8 @@ async function attemptForm(browser, ref) {
           }
         }).catch(e => ({ ok: false, reason: e.message }));
         console.log('[WHL]   DETAILFIRE: ' + JSON.stringify(fired).slice(0, 300));
+        // Network evidence: what did the postback actually request/return?
+        console.log('[WHL]   NETLOG(last 8): ' + JSON.stringify(netLog.slice(-8)));
 
         if (fired.ok) {
           // Wait for the in-frame navigation OR in-place content swap to detail.
@@ -354,6 +369,61 @@ async function attemptForm(browser, ref) {
             const detail = parseFromTables(detailTables, ref);
             console.log(`[WHL]   DETAIL parsed: ctnr="${detail.containerNo}" type="${detail.type}" ` +
                         `dest="${detail.destination}" eta="${detail.eta}"`);
+
+            // ── DIAGNOSTIC: if the detail fields are STILL empty after the
+            // postback navigated, dump exactly what's on the page so we can see
+            // why parseFromTables found nothing. This is the artifact the prior
+            // 12+ run cycles never captured: the real detail-page HTML at the
+            // moment of failure. Look for this block in the Actions log.
+            if (!detail.containerNo && !detail.eta && !detail.destination) {
+              const dump = await target.evaluate(() => {
+                const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+                const tables = [...document.querySelectorAll('table')].slice(0, 8).map((tbl, ti) => {
+                  const rows = [...tbl.querySelectorAll('tr')].slice(0, 12).map(tr =>
+                    [...tr.querySelectorAll('td,th')].map(td => clean(td.innerText)).filter(Boolean).join(' | ')
+                  ).filter(Boolean);
+                  return `  T${ti} [${tbl.className || 'no-class'}]: ` + rows.join('  //  ').slice(0, 500);
+                });
+                return {
+                  url: location.href,
+                  title: document.title,
+                  tableCount: document.querySelectorAll('table').length,
+                  classes: [...new Set([...document.querySelectorAll('table')].map(t => t.className).filter(Boolean))].slice(0, 10),
+                  iframes: [...document.querySelectorAll('iframe')].map(f => f.src || f.id || '(inline)').slice(0, 5),
+                  bodyText: clean(document.body?.innerText || '').slice(0, 600),
+                  tables,
+                };
+              }).catch(e => ({ err: e.message }));
+              console.log('[WHL]   ╔═══ DETAIL-EMPTY DUMP (' + ref + ') ═══╗');
+              console.log('[WHL]   url=' + (dump.url || '?') + ' title="' + (dump.title || '') + '"');
+              console.log('[WHL]   tableCount=' + dump.tableCount + ' classes=' + JSON.stringify(dump.classes));
+              console.log('[WHL]   iframes=' + JSON.stringify(dump.iframes));
+              console.log('[WHL]   bodyText="' + (dump.bodyText || '') + '"');
+              for (const t of (dump.tables || [])) console.log('[WHL] ' + t);
+              console.log('[WHL]   ╚═══ END DUMP ═══╝');
+              rec.detailDiag = 'detail-empty(tbl=' + dump.tableCount + ')';
+
+              // Also check child frames — the detail content sometimes loads in
+              // an iframe the postback opened rather than the main document.
+              for (const fr of target.frames()) {
+                if (fr === target.mainFrame()) continue;
+                const frHit = await fr.evaluate(() =>
+                  /ctnr no|container no|port of discharg|estimated/i.test(document.body?.innerText || '')
+                ).catch(() => false);
+                if (frHit) {
+                  console.log('[WHL]   >>> detail text FOUND in iframe: ' + (fr.url() || '').split('/').pop());
+                  const frTables = await readTables(fr);
+                  const frDetail = parseFromTables(frTables, ref);
+                  console.log(`[WHL]   iframe DETAIL: ctnr="${frDetail.containerNo}" eta="${frDetail.eta}" dest="${frDetail.destination}"`);
+                  if (frDetail.containerNo) { detail.containerNo = frDetail.containerNo; detail.type = frDetail.type; }
+                  if (frDetail.eta)         detail.eta         = frDetail.eta;
+                  if (frDetail.destination) detail.destination = frDetail.destination;
+                  if (frDetail.origin)      detail.origin      = frDetail.origin;
+                  break;
+                }
+              }
+            }
+
             rec.containerNo = rec.containerNo || detail.containerNo;
             rec.type        = rec.type        || detail.type;
             rec.origin      = rec.origin      || detail.origin;
@@ -595,16 +665,25 @@ async function scrapeWanHai(browser, bl) {
     return shape(ref, merged, true);
   }
 
-  // ── LAST RESORT: SeaRates API (only if a key is configured) ───────────────
+  // ── LAST RESORT: external API fallback (module optional) ──────────────────
+  // NOTE: scraper/wanhai-api.js is NOT committed to the repo as of this version,
+  // so this require throws MODULE_NOT_FOUND and we skip cleanly. Logged plainly
+  // so it's never mistaken for "the API tried and failed".
+  try {
+    require.resolve('./wanhai-api');
+  } catch {
+    console.log('[WHL] No wanhai-api.js module present — skipping API fallback (page extraction only).');
+    return shape(ref, null, false, lastErr);
+  }
   try {
     const { fetchWanHaiFromApi } = require('./wanhai-api');
     const api = await fetchWanHaiFromApi(ref, { forceUpdate: false });
     if (api && (api.containerNo || api.eta || api.vessel)) {
-      console.log(`[WHL] ${ref} -> page failed; SeaRates fallback OK`);
+      console.log(`[WHL] ${ref} -> page failed; API fallback OK`);
       return api;
     }
   } catch (e) {
-    console.log(`[WHL] SeaRates fallback also failed: ${e.message}`);
+    console.log(`[WHL] API fallback also failed: ${e.message}`);
   }
 
   return shape(ref, null, false, lastErr);
@@ -715,6 +794,14 @@ async function runWanHaiScraper() {
     for (const t of targets) {
       const rec = await scrapeWanHai(browser, t.bl);
       console.log(`[WHL] ${t.bl} -> ${rec.found ? 'OK' : 'KEEP-PREV'} | ${rec.vessel || '-'} | ${rec.status}`);
+      // Field-level verdict: makes the detail-gap obvious at a glance in the log.
+      const have = [];
+      const miss = [];
+      for (const k of ['vessel', 'voyage', 'containerNo', 'type', 'origin', 'destination', 'eta']) {
+        (rec[k] ? have : miss).push(k);
+      }
+      console.log(`[WHL]   VERDICT ${t.bl}: have=[${have.join(',')}] MISSING=[${miss.join(',')}]` +
+                  (rec.detailDiag ? ` diag=${rec.detailDiag}` : ''));
 
       const p = t.prev; // existing row, so we can preserve on failure
       const merged = rec.found ? rec : {
